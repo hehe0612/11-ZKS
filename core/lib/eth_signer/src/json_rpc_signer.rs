@@ -203,11 +203,11 @@ impl JsonRpcSigner {
                 .map_err(|err| SignerError::SigningFailed(err.to_string()))?
         };
 
-        if is_signature_from_address(&signature, &msg.as_bytes(), self.address()?)? {
+        if is_signature_from_address(&signature, msg.as_bytes(), self.address()?)? {
             self.signer_type = Some(SignerType::NotNeedPrefix);
         }
 
-        if is_signature_from_address(&signature, &msg_with_prefix.as_bytes(), self.address()?)? {
+        if is_signature_from_address(&signature, msg_with_prefix.as_bytes(), self.address()?)? {
             self.signer_type = Some(SignerType::NotNeedPrefix);
         }
 
@@ -318,9 +318,10 @@ mod messages {
 
         // Unlocks the address, after that the server can sign messages and transactions.
         pub fn unlock_account(address: Address, password: &str) -> Self {
-            let mut params = Vec::new();
-            params.push(serde_json::to_value(address).expect("serialization fail"));
-            params.push(serde_json::to_value(password).expect("serialization fail"));
+            let params = vec![
+                serde_json::to_value(address).expect("serialization fail"),
+                serde_json::to_value(password).expect("serialization fail"),
+            ];
             Self::create("personal_unlockAccount", params)
         }
 
@@ -328,11 +329,10 @@ mod messages {
         /// sign(keccak256("\x19Ethereum Signed Message:\n" + len(message) + message))).
         /// The address to sign with must be unlocked.
         pub fn sign_message(address: Address, message: &[u8]) -> Self {
-            let mut params = Vec::new();
-            params.push(serde_json::to_value(address).expect("serialization fail"));
-            params.push(
+            let params = vec![
+                serde_json::to_value(address).expect("serialization fail"),
                 serde_json::to_value(format!("0x{}", encode(message))).expect("serialization fail"),
-            );
+            ];
             Self::create("eth_sign", params)
         }
 
@@ -446,9 +446,12 @@ mod tests {
             let new_url = format!("127.0.0.1:{}", i);
             // Try to bind to some port, hope that 999 variants will be enough
             let tmp_state = state.clone();
-            if let Ok(ser) =
-                HttpServer::new(move || App::new().data(tmp_state.clone()).service(index))
-                    .bind(new_url.clone())
+            if let Ok(ser) = HttpServer::new(move || {
+                App::new()
+                    .app_data(web::Data::new(tmp_state.clone()))
+                    .service(index)
+            })
+            .bind(new_url.clone())
             {
                 server = Some(ser);
                 url = Some(new_url);
@@ -482,12 +485,16 @@ mod tests {
         let transaction_signature = client
             .sign_transaction(RawTransaction {
                 chain_id: 0,
+                transaction_type: None,
+                access_list: None,
+                max_fee_per_gas: Default::default(),
                 nonce: Default::default(),
                 to: None,
                 value: Default::default(),
                 gas_price: Default::default(),
                 gas: Default::default(),
                 data: vec![],
+                max_priority_fee_per_gas: Default::default(),
             })
             .await
             .unwrap();

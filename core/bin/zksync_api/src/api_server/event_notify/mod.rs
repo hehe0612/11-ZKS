@@ -5,6 +5,7 @@ use jsonrpc_pubsub::{
     SubscriptionId,
 };
 use std::time::Duration;
+use zksync_config::configs::api::TokenConfig;
 use zksync_storage::ConnectionPool;
 use zksync_types::tx::TxHash;
 use zksync_types::BlockNumber;
@@ -59,11 +60,16 @@ pub fn start_sub_notifier(
     mut subscription_stream: mpsc::Receiver<EventNotifierRequest>,
     api_requests_caches_size: usize,
     miniblock_interval: Duration,
+    token_config: &TokenConfig,
 ) -> tokio::task::JoinHandle<()> {
     let (new_block_sender, mut new_block_receiver) = mpsc::channel(NOTIFIER_CHANNEL_CAPACITY);
     let (new_txs_sender, mut new_txs_receiver) = mpsc::channel(NOTIFIER_CHANNEL_CAPACITY);
 
-    let mut notifier = OperationNotifier::new(api_requests_caches_size, db_pool.clone());
+    let mut notifier = OperationNotifier::new(
+        api_requests_caches_size,
+        db_pool.clone(),
+        token_config.invalidate_token_cache_period(),
+    );
 
     tokio::spawn(async move {
         let fetcher = EventFetcher::new(
@@ -83,14 +89,14 @@ pub fn start_sub_notifier(
                     if let Some(new_block) = new_block {
                         notifier.handle_new_block(new_block)
                             .await
-                            .map_err(|e| log::warn!("Failed to handle new block: {}",e))
+                            .map_err(|e| vlog::warn!("Failed to handle new block: {}",e))
                             .unwrap_or_default();
                     }
                 },
                 new_exec_batch = new_txs_receiver.next() => {
                     if let Some(new_exec_batch) = new_exec_batch {
                         notifier.handle_new_executed_batch(new_exec_batch)
-                            .map_err(|e| log::warn!("Failed to handle new exec batch: {}",e))
+                            .map_err(|e| vlog::warn!("Failed to handle new exec batch: {}",e))
                             .unwrap_or_default();
                     }
                 },
@@ -98,7 +104,7 @@ pub fn start_sub_notifier(
                     if let Some(new_sub) = new_sub {
                         notifier.handle_notify_req(new_sub)
                             .await
-                            .map_err(|e| log::warn!("Failed to handle notify request: {}",e))
+                            .map_err(|e| vlog::warn!("Failed to handle notify request: {}",e))
                             .unwrap_or_default();
                     }
                 },

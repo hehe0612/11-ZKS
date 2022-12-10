@@ -1,15 +1,19 @@
 use serde::Deserialize;
 use structopt::StructOpt;
 use web3::transports::Http;
-use zksync_config::ConfigurationOptions;
+use zksync_config::configs::{ChainConfig, ContractsConfig as EnvContractsConfig, ETHClientConfig};
 use zksync_crypto::convert::FeConvert;
 use zksync_storage::ConnectionPool;
 use zksync_types::{Address, H256};
 
+use web3::Web3;
+use zksync_data_restore::contract::ZkSyncDeployedContract;
 use zksync_data_restore::{
     add_tokens_to_storage, data_restore_driver::DataRestoreDriver,
-    database_storage_interactor::DatabaseStorageInteractor, END_ETH_BLOCKS_OFFSET, ETH_BLOCKS_STEP,
+    database_storage_interactor::DatabaseStorageInteractor, storage_interactor::StorageInteractor,
+    END_ETH_BLOCKS_OFFSET, ETH_BLOCKS_STEP,
 };
+use zksync_types::network::Network;
 
 #[derive(StructOpt)]
 #[structopt(
@@ -45,11 +49,12 @@ struct Opt {
 
 #[derive(Debug, Deserialize)]
 pub struct ContractsConfig {
-    eth_network: String,
+    eth_network: Network,
     governance_addr: Address,
     genesis_tx_hash: H256,
     contract_addr: Address,
-    available_block_chunk_sizes: Vec<usize>,
+    init_contract_version: u32,
+    upgrade_eth_blocks: Vec<u64>,
 }
 
 impl ContractsConfig {
@@ -60,28 +65,32 @@ impl ContractsConfig {
     }
 
     pub fn from_env() -> Self {
-        let config_opts = ConfigurationOptions::from_env();
+        let contracts_opts = EnvContractsConfig::from_env();
+        let chain_opts = ChainConfig::from_env();
 
         Self {
-            eth_network: config_opts.eth_network,
-            governance_addr: config_opts.governance_eth_addr,
-            genesis_tx_hash: config_opts.genesis_tx_hash,
-            contract_addr: config_opts.contract_eth_addr,
-            available_block_chunk_sizes: config_opts.available_block_chunk_sizes,
+            eth_network: chain_opts.eth.network,
+            governance_addr: contracts_opts.governance_addr,
+            genesis_tx_hash: contracts_opts.genesis_tx_hash,
+            contract_addr: contracts_opts.contract_addr,
+            init_contract_version: contracts_opts.init_contract_version,
+            upgrade_eth_blocks: contracts_opts.upgrade_eth_blocks,
         }
     }
 }
 
 #[tokio::main]
 async fn main() {
-    log::info!("Restoring zkSync state from the contract");
-    env_logger::init();
+    vlog::info!("Restoring zkSync state from the contract");
+    let _vlog_guard = vlog::init();
     let connection_pool = ConnectionPool::new(Some(1));
-    let config_opts = ConfigurationOptions::from_env();
 
     let opt = Opt::from_args();
 
-    let web3_url = opt.web3_url.unwrap_or(config_opts.web3_url);
+    let web3_url = opt.web3_url.unwrap_or_else(|| {
+        let config_opts = ETHClientConfig::from_env();
+        config_opts.web3_url()
+    });
 
     let transport = Http::new(&web3_url).expect("failed to start web3 transport");
 
@@ -89,6 +98,8 @@ async fn main() {
         .config_path
         .map(|path| ContractsConfig::from_file(&path))
         .unwrap_or_else(ContractsConfig::from_env);
+
+    vlog::info!("Using the following config: {:#?}", config);
 
     let finite_mode = opt.finite;
     let final_hash = if finite_mode {
@@ -98,27 +109,29 @@ async fn main() {
         None
     };
     let storage = connection_pool.access_storage().await.unwrap();
-
+    let web3 = Web3::new(transport);
+    let contract = ZkSyncDeployedContract::version4(web3.eth(), config.contract_addr);
     let mut driver = DataRestoreDriver::new(
-        transport,
+        web3,
         config.governance_addr,
-        config.contract_addr,
+        config.upgrade_eth_blocks,
+        config.init_contract_version,
         ETH_BLOCKS_STEP,
         END_ETH_BLOCKS_OFFSET,
-        config.available_block_chunk_sizes,
         finite_mode,
         final_hash,
+        contract,
     );
 
-    let mut interactor = DatabaseStorageInteractor::new(storage);
+    let mut interactor = StorageInteractor::Database(DatabaseStorageInteractor::new(storage));
     // If genesis is argument is present - there will be fetching contracts creation transactions to get first eth block and genesis acc address
     if opt.genesis {
         // We have to load pre-defined tokens into the database before restoring state,
         // since these tokens do not have a corresponding Ethereum events.
-        add_tokens_to_storage(&mut interactor, &config.eth_network).await;
+        add_tokens_to_storage(&mut interactor, &config.eth_network.to_string()).await;
 
         driver
-            .set_genesis_state(&mut interactor, config.genesis_tx_hash)
+            .set_genesis_state_from_eth(&mut interactor, config.genesis_tx_hash)
             .await;
     }
 

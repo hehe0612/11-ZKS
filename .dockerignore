@@ -1,10 +1,17 @@
 *
+!docker/prover/graceful-run.sh
 !docker/prover/prover-entry.sh
 !docker/exit-tool/exit-tool-entry.sh
 !docker/exit-tool/configs
+!docker/data-restore/data-restore-entry.sh
 !docker/keybase-secrets/entrypoint.sh
+!docker/ci-integration-test/entrypoint.sh
+!docker/zk/entrypoint.sh
 !etc/env/dev.env.example
+!etc/env/docker.env
+!etc/env/base
 !etc/tokens
+!etc/web3-abi
 !keys/packed
 !docker/nginx/nginx.conf
 !bin/
@@ -14,9 +21,5 @@
 !Cargo.lock
 !Cargo.toml
 !contracts/artifacts
-!infrastructure/explorer/index.html
-!infrastructure/explorer/dist
-!infrastructure/fee-seller
-!infrastructure/tok_cli
 !infrastructure/zk
 !sdk/zksync-rs

@@ -1,7 +1,6 @@
 pub mod hasher;
 pub mod parallel_smt;
 pub mod rescue_hasher;
-pub mod sequential_smt;
 #[cfg(test)]
 mod tests;
 
@@ -10,31 +9,24 @@ pub type SparseMerkleTree<T, H, HH> = parallel_smt::SparseMerkleTree<T, H, HH>;
 /// Default hasher used in the zkSync network for state hash calculations.
 pub type RescueHasher<T> = rescue_hasher::RescueHasher<T>;
 
-// TODO: return the code below and uncomment asserts (ZKS-107)
-
-// pub fn verify_proof<E: Account>(&self, index: u32, item: Account, proof: Vec<(E::Fr, bool)>) -> bool {
-//     use crate::sparse_merkle_tree::hasher::Hasher;
-
-//     assert!(index < self.capacity());
-//     let item_bits = item.get_bits_le();
-//     let mut hash = self.hasher.hash_bits(item_bits);
-//     let mut proof_index: u32 = 0;
-
-//     for (i, e) in proof.clone().into_iter().enumerate() {
-//         if e.1 {
-//             // current is right
-//             proof_index |= 1 << i;
-//             hash = self.hasher.compress(&e.0, &hash, i);
-//         } else {
-//             // current is left
-//             hash = self.hasher.compress(&hash, &e.0, i);
-//         }
-//         // print!("This level hash is {}\n", hash);
-//     }
-
-//     if proof_index != index {
-//         return false;
-//     }
-
-//     hash == self.root_hash()
-// }
+/// Represents the amount of RAM consumed by the tree.
+/// Only data allocated on the heap is counted.
+///
+/// Field represent the amount of memory actually requested by the system.
+/// For example, Rust `Vec`s allocate 2x previous amount on resize, so the `Vec` can
+/// request up to 2x the amount of memory than is needed to fit all the elements.
+///
+/// All the fields represent the memory amount in bytes.
+#[derive(Debug, Clone, Copy)]
+pub struct TreeMemoryUsage {
+    /// Memory used to store actual values in the tree.
+    pub items: usize,
+    /// Memory used to store hash nodes in the tree.
+    pub nodes: usize,
+    /// Memory used to store pre-calculated hashes for the "default" nodes.
+    pub prehashed: usize,
+    /// Memory used to store cache of calculated hashes for all the nodes in the tree.
+    pub cache: usize,
+    /// Total memory allocated by containers in the tree.
+    pub allocated_total: usize,
+}

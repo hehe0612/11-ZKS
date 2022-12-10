@@ -1,91 +1,119 @@
-import { AbstractJSONRPCTransport, HTTPTransport, WSTransport, DummyTransport } from './transport';
-import { ethers, Contract, BigNumber } from 'ethers';
+import { AbstractJSONRPCTransport, DummyTransport, HTTPTransport, WSTransport } from './transport';
+import { BigNumber, ethers } from 'ethers';
 import {
     AccountState,
     Address,
-    TokenLike,
-    TransactionReceipt,
-    PriorityOperationReceipt,
+    IncomingTxFeeType,
     ContractAddress,
-    Tokens,
-    TokenAddress,
-    TxEthSignature,
     Fee,
-    ChangePubKeyFee,
-    Network
+    Network,
+    PriorityOperationReceipt,
+    TokenAddress,
+    TokenLike,
+    Tokens,
+    TransactionReceipt,
+    TxEthSignature,
+    TxEthSignatureVariant,
+    NFTInfo,
+    Toggle2FARequest,
+    Toggle2FAResponse
 } from './types';
-import { isTokenETH, sleep, SYNC_GOV_CONTRACT_INTERFACE, TokenSet } from './utils';
+import { isTokenETH, sleep, TokenSet } from './utils';
+import {
+    Governance,
+    GovernanceFactory,
+    ZkSync,
+    ZkSyncFactory,
+    ZkSyncNFTFactory,
+    ZkSyncNFTFactoryFactory
+} from './typechain';
 
-export async function getDefaultProvider(network: Network, transport: 'WS' | 'HTTP' = 'WS'): Promise<Provider> {
+import { SyncProvider } from './provider-interface';
+
+export async function getDefaultProvider(
+    network: Network,
+    transport: 'WS' | 'HTTP' = 'HTTP',
+    pollIntervalMilliSecs?: number
+): Promise<Provider> {
+    if (transport === 'WS') {
+        console.warn('Websocket support will be removed in future. Use HTTP transport instead.');
+    }
     if (network === 'localhost') {
         if (transport === 'WS') {
-            return await Provider.newWebsocketProvider('ws://127.0.0.1:3031');
+            return await Provider.newWebsocketProvider('ws://127.0.0.1:3031', network);
         } else if (transport === 'HTTP') {
-            return await Provider.newHttpProvider('http://127.0.0.1:3030');
+            return await Provider.newHttpProvider('http://127.0.0.1:3030', pollIntervalMilliSecs, network);
         }
-    } else if (network === 'ropsten') {
+    } else if (network === 'goerli') {
         if (transport === 'WS') {
-            return await Provider.newWebsocketProvider('wss://ropsten-api.zksync.io/jsrpc-ws');
+            return await Provider.newWebsocketProvider('wss://goerli-api.zksync.io/jsrpc-ws', network);
         } else if (transport === 'HTTP') {
-            return await Provider.newHttpProvider('https://ropsten-api.zksync.io/jsrpc');
+            return await Provider.newHttpProvider('https://goerli-api.zksync.io/jsrpc', pollIntervalMilliSecs, network);
         }
-    } else if (network === 'rinkeby') {
+    } else if (network === 'goerli-beta') {
         if (transport === 'WS') {
-            return await Provider.newWebsocketProvider('wss://rinkeby-api.zksync.io/jsrpc-ws');
+            return await Provider.newWebsocketProvider('wss://goerli-beta-api.zksync.dev/jsrpc-ws', network);
         } else if (transport === 'HTTP') {
-            return await Provider.newHttpProvider('https://rinkeby-api.zksync.io/jsrpc');
-        }
-    } else if (network === 'ropsten-beta') {
-        if (transport === 'WS') {
-            return await Provider.newWebsocketProvider('wss://ropsten-beta-api.zksync.io/jsrpc-ws');
-        } else if (transport === 'HTTP') {
-            return await Provider.newHttpProvider('https://ropsten-beta-api.zksync.io/jsrpc');
+            return await Provider.newHttpProvider(
+                'https://goerli-beta-api.zksync.dev/jsrpc',
+                pollIntervalMilliSecs,
+                network
+            );
         }
     } else if (network === 'rinkeby-beta') {
         if (transport === 'WS') {
-            return await Provider.newWebsocketProvider('wss://rinkeby-beta-api.zksync.io/jsrpc-ws');
+            return await Provider.newWebsocketProvider('wss://rinkeby-beta-api.zksync.io/jsrpc-ws', network);
         } else if (transport === 'HTTP') {
-            return await Provider.newHttpProvider('https://rinkeby-beta-api.zksync.io/jsrpc');
+            return await Provider.newHttpProvider(
+                'https://rinkeby-beta-api.zksync.io/jsrpc',
+                pollIntervalMilliSecs,
+                network
+            );
         }
     } else if (network === 'mainnet') {
         if (transport === 'WS') {
-            return await Provider.newWebsocketProvider('wss://api.zksync.io/jsrpc-ws');
+            return await Provider.newWebsocketProvider('wss://api.zksync.io/jsrpc-ws', network);
         } else if (transport === 'HTTP') {
-            return await Provider.newHttpProvider('https://api.zksync.io/jsrpc');
+            return await Provider.newHttpProvider('https://api.zksync.io/jsrpc', pollIntervalMilliSecs, network);
         }
     } else {
         throw new Error(`Ethereum network ${network} is not supported`);
     }
 }
 
-export class Provider {
-    contractAddress: ContractAddress;
-    public tokenSet: TokenSet;
+export class Provider extends SyncProvider {
+    private constructor(public transport: AbstractJSONRPCTransport) {
+        super();
+        this.providerType = 'RPC';
+    }
 
-    // For HTTP provider
-    public pollIntervalMilliSecs = 500;
-
-    private constructor(public transport: AbstractJSONRPCTransport) {}
-
-    static async newWebsocketProvider(address: string): Promise<Provider> {
+    /**
+     * @deprecated Websocket support will be removed in future. Use HTTP transport instead.
+     */
+    static async newWebsocketProvider(address: string, network?: Network): Promise<Provider> {
         const transport = await WSTransport.connect(address);
         const provider = new Provider(transport);
-        provider.contractAddress = await provider.getContractAddress();
-        provider.tokenSet = new TokenSet(await provider.getTokens());
+        const contractsAndTokens = await Promise.all([provider.getContractAddress(), provider.getTokens()]);
+        provider.contractAddress = contractsAndTokens[0];
+        provider.tokenSet = new TokenSet(contractsAndTokens[1]);
+        provider.network = network;
         return provider;
     }
 
     static async newHttpProvider(
         address: string = 'http://127.0.0.1:3030',
-        pollIntervalMilliSecs?: number
+        pollIntervalMilliSecs?: number,
+        network?: Network
     ): Promise<Provider> {
         const transport = new HTTPTransport(address);
         const provider = new Provider(transport);
         if (pollIntervalMilliSecs) {
             provider.pollIntervalMilliSecs = pollIntervalMilliSecs;
         }
-        provider.contractAddress = await provider.getContractAddress();
-        provider.tokenSet = new TokenSet(await provider.getTokens());
+        const contractsAndTokens = await Promise.all([provider.getContractAddress(), provider.getTokens()]);
+        provider.contractAddress = contractsAndTokens[0];
+        provider.tokenSet = new TokenSet(contractsAndTokens[1]);
+        provider.network = network;
         return provider;
     }
 
@@ -93,30 +121,39 @@ export class Provider {
      * Provides some hardcoded values the `Provider` responsible for
      * without communicating with the network
      */
-    static async newMockProvider(network: string, ethPrivateKey: Uint8Array): Promise<Provider> {
-        const transport = new DummyTransport(network, ethPrivateKey);
+    static async newMockProvider(network: Network, ethPrivateKey: Uint8Array, getTokens: Function): Promise<Provider> {
+        const transport = new DummyTransport(network, ethPrivateKey, getTokens);
         const provider = new Provider(transport);
 
-        provider.contractAddress = await provider.getContractAddress();
-        provider.tokenSet = new TokenSet(await provider.getTokens());
+        const contractsAndTokens = await Promise.all([provider.getContractAddress(), provider.getTokens()]);
+        provider.contractAddress = contractsAndTokens[0];
+        provider.tokenSet = new TokenSet(contractsAndTokens[1]);
+        provider.network = network;
         return provider;
     }
 
     // return transaction hash (e.g. sync-tx:dead..beef)
-    async submitTx(tx: any, signature?: TxEthSignature, fastProcessing?: boolean): Promise<string> {
+    async submitTx(tx: any, signature?: TxEthSignatureVariant, fastProcessing?: boolean): Promise<string> {
         return await this.transport.request('tx_submit', [tx, signature, fastProcessing]);
     }
 
     // Requests `zkSync` server to execute several transactions together.
     // return transaction hash (e.g. sync-tx:dead..beef)
     async submitTxsBatch(
-        transactions: { tx: any; signature?: TxEthSignature }[],
-        ethSignatures?: TxEthSignature[]
+        transactions: { tx: any; signature?: TxEthSignatureVariant }[],
+        ethSignatures?: TxEthSignature | TxEthSignature[]
     ): Promise<string[]> {
-        return await this.transport.request('submit_txs_batch', [
-            transactions,
-            ethSignatures == undefined ? [] : ethSignatures
-        ]);
+        let signatures: TxEthSignature[] = [];
+        // For backwards compatibility we allow sending single signature as well
+        // as no signatures at all.
+        if (ethSignatures == undefined) {
+            signatures = [];
+        } else if (ethSignatures instanceof Array) {
+            signatures = ethSignatures;
+        } else {
+            signatures.push(ethSignatures);
+        }
+        return await this.transport.request('submit_txs_batch', [transactions, signatures]);
     }
 
     async getContractAddress(): Promise<ContractAddress> {
@@ -146,6 +183,21 @@ export class Provider {
 
     async getEthTxForWithdrawal(withdrawal_hash: string): Promise<string> {
         return await this.transport.request('get_eth_tx_for_withdrawal', [withdrawal_hash]);
+    }
+
+    async getNFT(id: number): Promise<NFTInfo> {
+        const nft = await this.transport.request('get_nft', [id]);
+
+        // If the NFT does not exist, throw an exception
+        if (nft == null) {
+            throw new Error(`Requested NFT doesn't exist or the corresponding mintNFT operation is not verified yet`);
+        }
+
+        return nft;
+    }
+
+    async getNFTOwner(id: number): Promise<number> {
+        return await this.transport.request('get_nft_owner', [id]);
     }
 
     async notifyPriorityOp(serialId: number, action: 'COMMIT' | 'VERIFY'): Promise<PriorityOperationReceipt> {
@@ -205,11 +257,7 @@ export class Provider {
         }
     }
 
-    async getTransactionFee(
-        txType: 'Withdraw' | 'Transfer' | 'FastWithdraw' | ChangePubKeyFee,
-        address: Address,
-        tokenLike: TokenLike
-    ): Promise<Fee> {
+    async getTransactionFee(txType: IncomingTxFeeType, address: Address, tokenLike: TokenLike): Promise<Fee> {
         const transactionFee = await this.transport.request('get_tx_fee', [txType, address.toString(), tokenLike]);
         return {
             feeType: transactionFee.feeType,
@@ -222,7 +270,7 @@ export class Provider {
     }
 
     async getTransactionsBatchFee(
-        txTypes: ('Withdraw' | 'Transfer' | 'FastWithdraw' | ChangePubKeyFee)[],
+        txTypes: IncomingTxFeeType[],
         addresses: Address[],
         tokenLike: TokenLike
     ): Promise<BigNumber> {
@@ -235,20 +283,62 @@ export class Provider {
         return parseFloat(tokenPrice);
     }
 
-    async disconnect() {
+    async toggle2FA(toggle2FA: Toggle2FARequest): Promise<boolean> {
+        const result: Toggle2FAResponse = await this.transport.request('toggle_2fa', [toggle2FA]);
+        return result.success;
+    }
+
+    async getNFTIdByTxHash(txHash: string): Promise<number> {
+        return await this.transport.request('get_nft_id_by_tx_hash', [txHash]);
+    }
+
+    override async disconnect() {
         return await this.transport.disconnect();
     }
 }
 
 export class ETHProxy {
-    private governanceContract: Contract;
+    private governanceContract: Governance;
+    private zkSyncContract: ZkSync;
+    private zksyncNFTFactory: ZkSyncNFTFactory;
+    // Needed for typechain to work
+    private dummySigner: ethers.VoidSigner;
 
     constructor(private ethersProvider: ethers.providers.Provider, public contractAddress: ContractAddress) {
-        this.governanceContract = new Contract(
-            this.contractAddress.govContract,
-            SYNC_GOV_CONTRACT_INTERFACE,
-            this.ethersProvider
-        );
+        this.dummySigner = new ethers.VoidSigner(ethers.constants.AddressZero, this.ethersProvider);
+
+        const governanceFactory = new GovernanceFactory(this.dummySigner);
+        this.governanceContract = governanceFactory.attach(contractAddress.govContract);
+
+        const zkSyncFactory = new ZkSyncFactory(this.dummySigner);
+        this.zkSyncContract = zkSyncFactory.attach(contractAddress.mainContract);
+    }
+
+    getGovernanceContract(): Governance {
+        return this.governanceContract;
+    }
+
+    getZkSyncContract(): ZkSync {
+        return this.zkSyncContract;
+    }
+
+    // This method is very helpful for those who have already fetched the
+    // default factory and want to avoid asynchorouns execution from now on
+    getCachedNFTDefaultFactory(): ZkSyncNFTFactory | undefined {
+        return this.zksyncNFTFactory;
+    }
+
+    async getDefaultNFTFactory(): Promise<ZkSyncNFTFactory> {
+        if (this.zksyncNFTFactory) {
+            return this.zksyncNFTFactory;
+        }
+
+        const nftFactoryAddress = await this.governanceContract.defaultFactory();
+
+        const nftFactory = new ZkSyncNFTFactoryFactory(this.dummySigner);
+        this.zksyncNFTFactory = nftFactory.attach(nftFactoryAddress);
+
+        return this.zksyncNFTFactory;
     }
 
     async resolveTokenId(token: TokenAddress): Promise<number> {

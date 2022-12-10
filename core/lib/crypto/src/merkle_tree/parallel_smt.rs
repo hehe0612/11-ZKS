@@ -1,18 +1,35 @@
 /// Sparse Merkle tree with batch updates
-use super::hasher::Hasher;
-use crate::ff::{PrimeField, PrimeFieldRepr};
-use crate::primitives::GetBits;
-use crate::Fr;
+use super::{hasher::Hasher, TreeMemoryUsage};
+use crate::{
+    ff::{PrimeField, PrimeFieldRepr},
+    primitives::GetBits,
+    Fr,
+};
 
 use fnv::FnvHashMap;
 use serde::{Deserialize, Serialize};
-use std::fmt::Debug;
-use std::sync::{RwLock, RwLockReadGuard};
+use std::{
+    fmt::Debug,
+    sync::{RwLock, RwLockReadGuard},
+};
 
 /// Nodes are indexed starting with index(root) = 0
 /// To store the index, at least 2 * TREE_HEIGHT bits is required.
 /// Wrapper-structure is used to avoid mixing up with `ItemIndex` on the type level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    bincode::Encode,
+    bincode::Decode,
+)]
 struct NodeIndex(pub u64);
 
 /// Lead index: 0 <= i < N.
@@ -91,18 +108,18 @@ where
 
         Self {
             items,
-            prehashed,
-            tree_depth,
             hasher,
+            tree_depth,
             root,
             nodes,
+            prehashed,
             cache,
         }
     }
 }
 
 /// Merkle Tree branch node.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct Node {
     depth: Depth,
     index: NodeIndex,
@@ -164,13 +181,12 @@ where
         assert!(tree_depth > 1);
         let hasher = H::default();
         let items = FnvHashMap::default();
-        let mut nodes = Vec::new();
-        nodes.push(Node {
+        let nodes = vec![Node {
             index: NodeIndex(1),
             depth: 0,
             left: None,
             right: None,
-        });
+        }];
 
         let mut prehashed = Vec::with_capacity(tree_depth);
         let mut cur = hasher.hash_bits(T::default().get_bits_le());
@@ -192,6 +208,52 @@ where
             cache,
             root: 0,
         }
+    }
+
+    /// Roughly calculates the data on the RAM usage for this tree object.
+    /// See the [`TreeMemoryUsage`] doc-comments for details.
+    pub fn memory_stats(&self) -> TreeMemoryUsage {
+        use std::mem::size_of;
+
+        // For hashmaps, we use both size of keys and values.
+        let items = self.items.capacity() * (size_of::<ItemIndex>() + size_of::<T>());
+        let nodes = self.nodes.capacity() * size_of::<Node>();
+        let prehashed = self.prehashed.capacity() * size_of::<Hash>();
+        let cache =
+            self.cache.read().unwrap().capacity() * (size_of::<NodeIndex>() + size_of::<Hash>());
+        let allocated_total = items + nodes + prehashed + cache;
+
+        TreeMemoryUsage {
+            items,
+            nodes,
+            prehashed,
+            cache,
+            allocated_total,
+        }
+    }
+}
+
+impl<T, Hash, H> SparseMerkleTree<T, Hash, H>
+where
+    T: GetBits + Default + Sync,
+    Hash: Clone + Debug + Sync + Send + Eq,
+    H: Hasher<Hash> + Sync,
+{
+    /// Verifies the given proof for the given element and index.
+    pub fn verify_proof(&self, element_index: u32, element: T, proof: Vec<(Hash, bool)>) -> bool {
+        let mut proof_index = 0;
+        let mut aggregated_hash = self.hasher.hash_bits(element.get_bits_le());
+        for (level, (hash, dir)) in proof.into_iter().enumerate() {
+            let (lhs, rhs) = if dir {
+                proof_index |= 1 << level;
+                (hash, aggregated_hash)
+            } else {
+                (aggregated_hash, hash)
+            };
+
+            aggregated_hash = self.hasher.compress(&lhs, &rhs, level);
+        }
+        proof_index == element_index && aggregated_hash == self.root_hash()
     }
 }
 
@@ -500,8 +562,8 @@ where
         right: Option<NodeRef>,
     ) -> NodeRef {
         self.nodes.push(Node {
-            index,
             depth,
+            index,
             left,
             right,
         });
@@ -652,11 +714,24 @@ where
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, bincode::Encode, bincode::Decode)]
 pub struct SparseMerkleTreeSerializableCacheBN256 {
     root: NodeRef,
     nodes: Vec<Node>,
     cache: Vec<(NodeIndex, [u8; 32])>,
+}
+
+impl SparseMerkleTreeSerializableCacheBN256 {
+    pub fn encode_bincode(&self) -> Vec<u8> {
+        bincode::encode_to_vec(self, bincode::config::standard())
+            .expect("Unable to encode Merkle Tree cache")
+    }
+
+    pub fn decode_bincode(data: &[u8]) -> Self {
+        bincode::decode_from_slice(data, bincode::config::standard())
+            .expect("Unable to decode Merkle Tree cache")
+            .0
+    }
 }
 
 impl<T, H> SparseMerkleTree<T, Fr, H>
@@ -705,17 +780,11 @@ where
 mod tests {
     use super::*;
 
-    #[derive(Debug)]
+    #[derive(Debug, Default)]
     struct TestHasher;
 
-    #[derive(Debug, PartialEq)]
+    #[derive(Debug, PartialEq, Default)]
     struct TestLeaf(u64);
-
-    impl Default for TestLeaf {
-        fn default() -> Self {
-            TestLeaf(0)
-        }
-    }
 
     impl GetBits for TestLeaf {
         fn get_bits_le(&self) -> Vec<bool> {
@@ -726,12 +795,6 @@ mod tests {
                 i >>= 1;
             }
             acc
-        }
-    }
-
-    impl Default for TestHasher {
-        fn default() -> Self {
-            Self {}
         }
     }
 

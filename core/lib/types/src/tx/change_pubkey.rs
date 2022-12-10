@@ -1,21 +1,37 @@
-use crate::{
-    helpers::{is_fee_amount_packable, pack_fee_amount},
-    AccountId, Nonce,
-};
+use num::{BigUint, Zero};
+use std::fmt::{Display, Formatter};
 
-use crate::account::PubKeyHash;
-use anyhow::ensure;
-use num::BigUint;
 use parity_crypto::Keccak256;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
 use zksync_basic_types::{Address, TokenId, H256};
 use zksync_crypto::{
-    params::{max_account_id, max_token_id},
+    params::{max_account_id, max_processable_token, CURRENT_TX_VERSION},
     PrivateKey,
 };
-use zksync_utils::BigUintSerdeAsRadix10Str;
+use zksync_utils::{format_units, BigUintSerdeAsRadix10Str};
 
-use super::{PackedEthSignature, TxSignature, VerifiedSignatureCache};
+use super::{PackedEthSignature, TimeRange, TxSignature, VerifiedSignatureCache};
+use crate::tx::error::{
+    FEE_AMOUNT_IS_NOT_PACKABLE, INVALID_AUTH_DATA, WRONG_ACCOUNT_ID, WRONG_FEE_ERROR,
+    WRONG_SIGNATURE, WRONG_TIME_RANGE, WRONG_TOKEN_FOR_PAYING_FEE,
+};
+use crate::{
+    account::PubKeyHash,
+    helpers::{is_fee_amount_packable, pack_fee_amount},
+    tokens::ChangePubKeyFeeTypeArg,
+    tx::error::ChangePubkeySignedDataError,
+    tx::version::TxVersion,
+    AccountId, Nonce, TxFeeTypes,
+};
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Hash, Eq)]
+pub enum ChangePubKeyType {
+    Onchain,
+    ECDSA,
+    CREATE2,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -37,13 +53,12 @@ impl ChangePubKeyCREATE2Data {
     pub fn get_address(&self, pubkey_hash: &PubKeyHash) -> Address {
         let salt = {
             let mut bytes = Vec::new();
-            bytes.extend_from_slice(&pubkey_hash.data);
             bytes.extend_from_slice(self.salt_arg.as_bytes());
+            bytes.extend_from_slice(&pubkey_hash.data);
             bytes.keccak256()
         };
 
-        let mut bytes = Vec::new();
-        bytes.push(0xff);
+        let mut bytes = vec![0xff];
         bytes.extend_from_slice(self.creator_address.as_bytes());
         bytes.extend_from_slice(&salt);
         bytes.extend_from_slice(self.code_hash.as_bytes());
@@ -61,30 +76,24 @@ pub enum ChangePubKeyEthAuthData {
 
 impl ChangePubKeyEthAuthData {
     pub fn is_ecdsa(&self) -> bool {
-        match self {
-            ChangePubKeyEthAuthData::ECDSA(..) => true,
-            _ => false,
-        }
+        matches!(self, ChangePubKeyEthAuthData::ECDSA(..))
     }
 
     pub fn is_onchain(&self) -> bool {
-        match self {
-            ChangePubKeyEthAuthData::Onchain => true,
-            _ => false,
-        }
+        matches!(self, ChangePubKeyEthAuthData::Onchain)
+    }
+
+    pub fn is_create2(&self) -> bool {
+        matches!(self, ChangePubKeyEthAuthData::CREATE2(..))
     }
 
     pub fn get_eth_witness(&self) -> Vec<u8> {
         match self {
             ChangePubKeyEthAuthData::Onchain => Vec::new(),
-            ChangePubKeyEthAuthData::ECDSA(ChangePubKeyECDSAData {
-                eth_signature,
-                batch_hash,
-            }) => {
-                let mut bytes = Vec::new();
-                bytes.push(0x00);
+            ChangePubKeyEthAuthData::ECDSA(ChangePubKeyECDSAData { eth_signature, .. }) => {
+                let mut bytes = vec![0x00];
                 bytes.extend_from_slice(&eth_signature.serialize_packed());
-                bytes.extend_from_slice(batch_hash.as_bytes());
+                // bytes.extend_from_slice(batch_hash.as_bytes());
                 bytes
             }
             ChangePubKeyEthAuthData::CREATE2(ChangePubKeyCREATE2Data {
@@ -92,13 +101,20 @@ impl ChangePubKeyEthAuthData {
                 salt_arg,
                 code_hash,
             }) => {
-                let mut bytes = Vec::new();
-                bytes.push(0x01);
+                let mut bytes = vec![0x01];
                 bytes.extend_from_slice(creator_address.as_bytes());
                 bytes.extend_from_slice(salt_arg.as_bytes());
                 bytes.extend_from_slice(code_hash.as_bytes());
                 bytes
             }
+        }
+    }
+
+    pub fn get_fee_type(&self) -> ChangePubKeyType {
+        match self {
+            ChangePubKeyEthAuthData::Onchain => ChangePubKeyType::Onchain,
+            ChangePubKeyEthAuthData::ECDSA(_) => ChangePubKeyType::ECDSA,
+            ChangePubKeyEthAuthData::CREATE2(_) => ChangePubKeyType::CREATE2,
         }
     }
 }
@@ -129,8 +145,16 @@ pub struct ChangePubKey {
     /// fields can't be changed by an attacker.
     #[serde(default)]
     pub signature: TxSignature,
+    /// Transaction Ethereum signature. It may be `None` if `ChangePubKey` operation is authorized
+    /// onchain, otherwise the message must be signed by the Ethereum private key corresponding
+    /// to the account address.
+    pub eth_signature: Option<PackedEthSignature>,
     /// Data needed to check if Ethereum address authorized ChangePubKey operation
-    pub eth_auth_data: ChangePubKeyEthAuthData,
+    pub eth_auth_data: Option<ChangePubKeyEthAuthData>,
+    /// Time range when the transaction is valid
+    /// This fields must be Option<...> because of backward compatibility with first version of ZkSync
+    #[serde(flatten)]
+    pub time_range: Option<TimeRange>,
     #[serde(skip)]
     cached_signer: VerifiedSignatureCache,
 }
@@ -151,18 +175,21 @@ impl ChangePubKey {
         fee_token: TokenId,
         fee: BigUint,
         nonce: Nonce,
+        time_range: TimeRange,
         signature: Option<TxSignature>,
         eth_signature: Option<PackedEthSignature>,
     ) -> Self {
-        // TODO: support CREATE2
-        let eth_auth_data = eth_signature
-            .map(|eth_signature| {
-                ChangePubKeyEthAuthData::ECDSA(ChangePubKeyECDSAData {
-                    eth_signature,
-                    batch_hash: H256::zero(),
+        // TODO: support CREATE2 (ZKS-452)
+        let eth_auth_data = Some(
+            eth_signature
+                .map(|eth_signature| {
+                    ChangePubKeyEthAuthData::ECDSA(ChangePubKeyECDSAData {
+                        eth_signature,
+                        batch_hash: H256::zero(),
+                    })
                 })
-            })
-            .unwrap_or(ChangePubKeyEthAuthData::Onchain);
+                .unwrap_or(ChangePubKeyEthAuthData::Onchain),
+        );
 
         let mut tx = Self {
             account_id,
@@ -172,8 +199,10 @@ impl ChangePubKey {
             fee,
             nonce,
             signature: signature.clone().unwrap_or_default(),
+            eth_signature: None,
             eth_auth_data,
             cached_signer: VerifiedSignatureCache::NotCached,
+            time_range: Some(time_range),
         };
         if signature.is_some() {
             tx.cached_signer = VerifiedSignatureCache::Cached(tx.verify_signature());
@@ -182,7 +211,7 @@ impl ChangePubKey {
     }
 
     /// Creates a signed transaction using private key and
-    /// checks for the transaction correcteness.
+    /// checks the transaction correctness.
     #[allow(clippy::too_many_arguments)]
     pub fn new_signed(
         account_id: AccountId,
@@ -191,9 +220,10 @@ impl ChangePubKey {
         fee_token: TokenId,
         fee: BigUint,
         nonce: Nonce,
+        time_range: TimeRange,
         eth_signature: Option<PackedEthSignature>,
         private_key: &PrivateKey,
-    ) -> Result<Self, anyhow::Error> {
+    ) -> Result<Self, TransactionError> {
         let mut tx = Self::new(
             account_id,
             account,
@@ -201,42 +231,71 @@ impl ChangePubKey {
             fee_token,
             fee,
             nonce,
+            time_range,
             None,
             eth_signature,
         );
         tx.signature = TxSignature::sign_musig(private_key, &tx.get_bytes());
-        if !tx.check_correctness() {
-            anyhow::bail!("Transfer is incorrect, check amounts");
-        }
+        tx.check_correctness()?;
         Ok(tx)
     }
 
     /// Restores the `PubKeyHash` from the transaction signature.
-    pub fn verify_signature(&self) -> Option<PubKeyHash> {
+    pub fn verify_signature(&self) -> Option<(PubKeyHash, TxVersion)> {
         if let VerifiedSignatureCache::Cached(cached_signer) = &self.cached_signer {
             *cached_signer
-        } else if let Some(pub_key) = self.signature.verify_musig(&self.get_bytes()) {
-            Some(PubKeyHash::from_pubkey(&pub_key))
         } else {
-            None
+            if let Some(res) = self
+                .signature
+                .verify_musig(&self.get_old_bytes())
+                .map(|pub_key| PubKeyHash::from_pubkey(&pub_key))
+            {
+                return Some((res, TxVersion::Legacy));
+            }
+            self.signature
+                .verify_musig(&self.get_bytes())
+                .map(|pub_key| (PubKeyHash::from_pubkey(&pub_key), TxVersion::V1))
         }
+    }
+
+    /// Encodes the transaction data as the byte sequence according to the old zkSync protocol with 2 bytes token.
+    pub fn get_old_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&[Self::TX_TYPE]);
+        out.extend_from_slice(&self.account_id.to_be_bytes());
+        out.extend_from_slice(self.account.as_bytes());
+        out.extend_from_slice(&self.new_pk_hash.data);
+        out.extend_from_slice(&(self.fee_token.0 as u16).to_be_bytes());
+        out.extend_from_slice(&pack_fee_amount(&self.fee));
+        out.extend_from_slice(&self.nonce.to_be_bytes());
+        if let Some(time_range) = &self.time_range {
+            out.extend_from_slice(&time_range.as_be_bytes());
+        }
+        out
     }
 
     /// Encodes the transaction data as the byte sequence according to the zkSync protocol.
     pub fn get_bytes(&self) -> Vec<u8> {
+        self.get_bytes_with_version(CURRENT_TX_VERSION)
+    }
+
+    pub fn get_bytes_with_version(&self, version: u8) -> Vec<u8> {
         let mut out = Vec::new();
-        out.extend_from_slice(&[Self::TX_TYPE]);
+        out.extend_from_slice(&[255u8 - Self::TX_TYPE]);
+        out.extend_from_slice(&[version]);
         out.extend_from_slice(&self.account_id.to_be_bytes());
-        out.extend_from_slice(&self.account.as_bytes());
+        out.extend_from_slice(self.account.as_bytes());
         out.extend_from_slice(&self.new_pk_hash.data);
         out.extend_from_slice(&self.fee_token.to_be_bytes());
         out.extend_from_slice(&pack_fee_amount(&self.fee));
         out.extend_from_slice(&self.nonce.to_be_bytes());
+        let time_range = self.time_range.unwrap_or_default();
+        out.extend_from_slice(&time_range.as_be_bytes());
         out
     }
 
     /// Provides a message to be signed with the Ethereum private key.
-    pub fn get_eth_signed_data(&self) -> Result<Vec<u8>, anyhow::Error> {
+    pub fn get_eth_signed_data(&self) -> Result<Vec<u8>, ChangePubkeySignedDataError> {
         // Fee data is not included into ETH signature input, since it would require
         // to either have more chunks in pubdata (if fee amount is unpacked), unpack
         // fee on contract (if fee amount is packed), or display non human-readable
@@ -251,35 +310,144 @@ impl ChangePubKey {
         eth_signed_msg.extend_from_slice(&self.nonce.to_be_bytes());
         eth_signed_msg.extend_from_slice(&self.account_id.to_be_bytes());
         // In case this transaction is not part of a batch, we simply append zeros.
-        if let ChangePubKeyEthAuthData::ECDSA(ChangePubKeyECDSAData { batch_hash, .. }) =
+        if let Some(ChangePubKeyEthAuthData::ECDSA(ChangePubKeyECDSAData { batch_hash, .. })) =
             self.eth_auth_data
         {
             eth_signed_msg.extend_from_slice(batch_hash.as_bytes());
+        } else {
+            eth_signed_msg.extend_from_slice(H256::default().as_bytes());
         }
-        ensure!(
-            eth_signed_msg.len() == CHANGE_PUBKEY_SIGNATURE_LEN,
-            "Change pubkey signed message len is too big: {}, expected: {}",
-            eth_signed_msg.len(),
-            CHANGE_PUBKEY_SIGNATURE_LEN
+        if eth_signed_msg.len() != CHANGE_PUBKEY_SIGNATURE_LEN {
+            return Err(ChangePubkeySignedDataError::SignedMessageLengthMismatch {
+                actual: eth_signed_msg.len(),
+                expected: CHANGE_PUBKEY_SIGNATURE_LEN,
+            });
+        }
+        Ok(eth_signed_msg)
+    }
+
+    /// Provides an old message to be signed with the Ethereum private key.
+    pub fn get_old_eth_signed_data(&self) -> Result<Vec<u8>, ChangePubkeySignedDataError> {
+        // Fee data is not included into ETH signature input, since it would require
+        // to either have more chunks in pubdata (if fee amount is unpacked), unpack
+        // fee on contract (if fee amount is packed), or display non human-readable
+        // amount in message (if fee amount is packed and is not unpacked on contract).
+        // Either of these options is either non user-friendly or increase cost of
+        // operation. Instead, fee data is signed via zkSync signature, which is essentially
+        // free. This signature will be verified in the circuit.
+
+        const CHANGE_PUBKEY_SIGNATURE_LEN: usize = 152;
+        let mut eth_signed_msg = Vec::with_capacity(CHANGE_PUBKEY_SIGNATURE_LEN);
+        eth_signed_msg.extend_from_slice(b"Register zkSync pubkey:\n\n");
+        eth_signed_msg.extend_from_slice(
+            format!(
+                "{pubkey}\n\
+                 nonce: 0x{nonce}\n\
+                 account id: 0x{account_id}\
+                 \n\n",
+                pubkey = hex::encode(&self.new_pk_hash.data).to_ascii_lowercase(),
+                nonce = hex::encode(&self.nonce.to_be_bytes()).to_ascii_lowercase(),
+                account_id = hex::encode(&self.account_id.to_be_bytes()).to_ascii_lowercase()
+            )
+            .as_bytes(),
         );
+        eth_signed_msg.extend_from_slice(b"Only sign this message for a trusted client!");
+
+        if eth_signed_msg.len() != CHANGE_PUBKEY_SIGNATURE_LEN {
+            return Err(ChangePubkeySignedDataError::SignedMessageLengthMismatch {
+                actual: eth_signed_msg.len(),
+                expected: CHANGE_PUBKEY_SIGNATURE_LEN,
+            });
+        }
         Ok(eth_signed_msg)
     }
 
     pub fn is_eth_auth_data_valid(&self) -> bool {
-        match &self.eth_auth_data {
-            ChangePubKeyEthAuthData::Onchain => true, // Should query Ethereum to check it
-            ChangePubKeyEthAuthData::ECDSA(ChangePubKeyECDSAData { eth_signature, .. }) => {
-                let recovered_address = self
-                    .get_eth_signed_data()
-                    .ok()
-                    .and_then(|msg| eth_signature.signature_recover_signer(&msg).ok());
-                recovered_address == Some(self.account)
+        if let Some(eth_auth_data) = &self.eth_auth_data {
+            match eth_auth_data {
+                ChangePubKeyEthAuthData::Onchain => true, // Should query Ethereum to check it
+                ChangePubKeyEthAuthData::ECDSA(ChangePubKeyECDSAData { eth_signature, .. }) => {
+                    let recovered_address = self
+                        .get_eth_signed_data()
+                        .ok()
+                        .and_then(|msg| eth_signature.signature_recover_signer(&msg).ok());
+                    recovered_address == Some(self.account)
+                }
+                ChangePubKeyEthAuthData::CREATE2(create2_data) => {
+                    let create2_address = create2_data.get_address(&self.new_pk_hash);
+                    create2_address == self.account
+                }
             }
-            ChangePubKeyEthAuthData::CREATE2(create2_data) => {
-                let create2_address = create2_data.get_address(&self.new_pk_hash);
-                create2_address == self.account
+        } else if let Some(old_eth_signature) = &self.eth_signature {
+            let recovered_address = self
+                .get_old_eth_signed_data()
+                .ok()
+                .and_then(|msg| old_eth_signature.signature_recover_signer(&msg).ok());
+            recovered_address == Some(self.account)
+        } else {
+            true
+        }
+    }
+
+    pub fn is_ecdsa(&self) -> bool {
+        if let Some(auth_data) = &self.eth_auth_data {
+            auth_data.is_ecdsa()
+        } else {
+            self.eth_signature.is_some()
+        }
+    }
+
+    pub fn is_onchain(&self) -> bool {
+        if let Some(auth_data) = &self.eth_auth_data {
+            auth_data.is_onchain()
+        } else {
+            self.eth_signature.is_none()
+        }
+    }
+
+    /// Get part of the message that should be signed with Ethereum account key for the batch of transactions.
+    /// The message for single `ChangePubKey` transaction is defined differently. The pattern is:
+    ///
+    /// Set signing key: {pubKeyHash}
+    /// [Fee: {fee} {token}]
+    ///
+    /// Note that the second line is optional.
+    pub fn get_ethereum_sign_message_part(&self, token_symbol: &str, decimals: u8) -> String {
+        let mut message = format!(
+            "Set signing key: {}",
+            hex::encode(&self.new_pk_hash.data).to_ascii_lowercase()
+        );
+        if !self.fee.is_zero() {
+            message.push_str(
+                format!(
+                    "\nFee: {fee} {token}",
+                    fee = format_units(&self.fee, decimals),
+                    token = token_symbol,
+                )
+                .as_str(),
+            );
+        }
+        message
+    }
+
+    pub fn get_change_pubkey_fee_type(&self) -> ChangePubKeyFeeTypeArg {
+        if let Some(auth_data) = &self.eth_auth_data {
+            ChangePubKeyFeeTypeArg::ContractsV4Version(auth_data.get_fee_type())
+        } else {
+            ChangePubKeyFeeTypeArg::PreContracts4Version {
+                onchain_pubkey_auth: self.eth_signature.is_none(),
             }
         }
+    }
+
+    pub fn get_fee_type(&self) -> TxFeeTypes {
+        TxFeeTypes::ChangePubKey(self.get_change_pubkey_fee_type())
+    }
+
+    /// Helper method to remove cache and test transaction behavior without the signature cache.
+    #[doc(hidden)]
+    pub fn wipe_signer_cache(&mut self) {
+        self.cached_signer = VerifiedSignatureCache::NotCached;
     }
 
     /// Verifies the transaction correctness:
@@ -289,11 +457,66 @@ impl ChangePubKey {
     /// - `account_id` field must be within supported range.
     /// - `fee_token` field must be within supported range.
     /// - `fee` field must represent a packable value.
-    pub fn check_correctness(&self) -> bool {
-        self.is_eth_auth_data_valid()
-            && self.verify_signature() == Some(self.new_pk_hash)
-            && self.account_id <= max_account_id()
-            && self.fee_token <= max_token_id()
-            && is_fee_amount_packable(&self.fee)
+    pub fn check_correctness(&mut self) -> Result<(), TransactionError> {
+        if !self.is_eth_auth_data_valid() {
+            return Err(TransactionError::InvalidAuthData);
+        }
+        if self.fee > BigUint::from(u128::MAX) {
+            return Err(TransactionError::WrongFee);
+        }
+        if self.account_id > max_account_id() {
+            return Err(TransactionError::WrongAccountId);
+        }
+
+        if self.fee_token > max_processable_token() {
+            return Err(TransactionError::WrongFeeToken);
+        }
+        if !is_fee_amount_packable(&self.fee) {
+            return Err(TransactionError::FeeNotPackable);
+        }
+
+        if !self
+            .time_range
+            .map(|r| r.check_correctness())
+            .unwrap_or(true)
+        {
+            return Err(TransactionError::WrongTimeRange);
+        }
+        let signer = self.verify_signature();
+        self.cached_signer = VerifiedSignatureCache::Cached(signer);
+        if let Some((pub_key_hash, _)) = &signer {
+            if *pub_key_hash != self.new_pk_hash {
+                return Err(TransactionError::WrongSignature);
+            }
+        } else {
+            return Err(TransactionError::WrongSignature);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Error, Debug, Copy, Clone, Serialize, Deserialize)]
+pub enum TransactionError {
+    InvalidAuthData,
+    WrongFee,
+    FeeNotPackable,
+    WrongAccountId,
+    WrongFeeToken,
+    WrongTimeRange,
+    WrongSignature,
+}
+
+impl Display for TransactionError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let error = match self {
+            TransactionError::WrongFee => WRONG_FEE_ERROR,
+            TransactionError::FeeNotPackable => FEE_AMOUNT_IS_NOT_PACKABLE,
+            TransactionError::WrongAccountId => WRONG_ACCOUNT_ID,
+            TransactionError::WrongTimeRange => WRONG_TIME_RANGE,
+            TransactionError::WrongSignature => WRONG_SIGNATURE,
+            TransactionError::WrongFeeToken => WRONG_TOKEN_FOR_PAYING_FEE,
+            TransactionError::InvalidAuthData => INVALID_AUTH_DATA,
+        };
+        write!(f, "{}", error)
     }
 }

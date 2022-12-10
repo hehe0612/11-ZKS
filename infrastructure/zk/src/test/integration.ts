@@ -85,7 +85,7 @@ export async function inDocker(command: string, timeout: number) {
     timer.unref();
 
     const volume = `${process.env.ZKSYNC_HOME}:/usr/src/zksync`;
-    const image = `matterlabs/ci-integration-test:zk-latest`;
+    const image = `matterlabs/ci-integration-test:latest`;
     await utils.spawn(
         `docker run -v ${volume} ${image} bash -c "/usr/local/bin/entrypoint.sh && ${command} || zk run cat-logs 1"`
     );
@@ -94,34 +94,43 @@ export async function inDocker(command: string, timeout: number) {
 export async function all() {
     await server();
     await api();
-    await zcli();
+    await apiDocs();
+    await withdrawalHelpers();
     await rustSDK();
     // have to kill server before running data-restore
     await utils.spawn('killall zksync_server');
     await run.dataRestore.checkExisting();
 }
 
-export async function api() {
-    await utils.spawn('yarn ts-tests api-test');
+export async function apiDocs() {
+    await utils.spawn('api_docs');
+    // Checks that documentation can be built successfully.
+    await utils.spawn('api_docs compile');
+    await utils.spawn('api_docs generate-docs');
+    // Checks that response structures of endpoints match structures defined in the documentation.
+    await utils.spawn('api_docs compile --test');
+    await utils.spawn('api_docs test');
 }
 
-export async function zcli() {
-    await utils.spawn('yarn zcli test');
+export async function api() {
+    await utils.spawn('yarn ts-tests api-test');
 }
 
 export async function server() {
     await utils.spawn('yarn ts-tests test');
 }
 
+export async function withdrawalHelpers() {
+    await utils.spawn('yarn ts-tests withdrawal-helpers-test');
+}
+
 export async function testkit(command: string, timeout: number) {
     let containerID = '';
-    const prevUrl = process.env.WEB3_URL;
-    if (process.env.ZKSYNC_ENV == 'ci') {
-        process.env.WEB3_URL = 'http://geth-fast:8545';
-    } else if (process.env.ZKSYNC_ENV == 'dev') {
+    const prevUrls = process.env.ETH_CLIENT_WEB3_URL?.split(',')[0];
+    if (process.env.ZKSYNC_ENV == 'dev' && process.env.CI != '1') {
         const { stdout } = await utils.exec('docker run --rm -d -p 7545:8545 matterlabs/geth:latest fast');
         containerID = stdout;
-        process.env.WEB3_URL = 'http://localhost:7545';
+        process.env.ETH_CLIENT_WEB3_URL = 'http://localhost:7545';
     }
     process.on('SIGINT', () => {
         console.log('interrupt received');
@@ -141,7 +150,7 @@ export async function testkit(command: string, timeout: number) {
     // but be careful! this is not called upon explicit termination
     // e.g. on SIGINT or process.exit()
     process.on('beforeExit', async (code) => {
-        if (process.env.ZKSYNC_ENV == 'dev') {
+        if (process.env.ZKSYNC_ENV == 'dev' && process.env.CI != '1') {
             try {
                 // probably should be replaced with child_process.execSync in future
                 // to change the hook to program.on('exit', ...)
@@ -149,24 +158,26 @@ export async function testkit(command: string, timeout: number) {
             } catch {
                 console.error('Problem killing', containerID);
             }
-            process.env.WEB3_URL = prevUrl;
+            process.env.ETH_CLIENT_WEB3_URL = prevUrls;
             // this has to be here - or else we will call this hook again
             process.exit(code);
         }
     });
 
-    process.env.ETH_NETWORK = 'test';
+    process.env.CHAIN_ETH_NETWORK = 'test';
     await run.verifyKeys.unpack();
     await contract.build();
 
-    if (command == 'block-sizes') {
-        await utils.spawn('cargo run --bin block_sizes_test --release');
+    if (command.includes('block_sizes_test ')) {
+        await utils.spawn(`cargo run --release --bin ${command}`);
     } else if (command == 'fast') {
         await utils.spawn('cargo run --bin testkit_tests --release');
         await utils.spawn('cargo run --bin gas_price_test --release');
-        // await utils.spawn('cargo run --bin migration_test --release');
         await utils.spawn('cargo run --bin revert_blocks_test --release');
-        // await utils.spawn('cargo run --bin exodus_test --release');
+        await utils.spawn('cargo run --bin migration_test --release');
+        await utils.spawn('cargo run --bin exodus_test --release');
+    } else {
+        await utils.spawn(`cargo run --bin ${command} --release`);
     }
 }
 
@@ -193,19 +204,19 @@ command
     });
 
 command
-    .command('zcli')
-    .description('run zcli integration tests')
-    .option('--with-server')
-    .action(async (cmd: Command) => {
-        cmd.withServer ? await withServer(zcli, 240) : await zcli();
-    });
-
-command
     .command('server')
     .description('run server integration tests')
     .option('--with-server')
     .action(async (cmd: Command) => {
         cmd.withServer ? await withServer(server, 1200) : await server();
+    });
+
+command
+    .command('withdrawal-helpers')
+    .description('run withdrawal helpers integration tests')
+    .option('--with-server')
+    .action(async (cmd: Command) => {
+        cmd.withServer ? await withServer(withdrawalHelpers, 1200) : await withdrawalHelpers();
     });
 
 command
@@ -225,12 +236,25 @@ command
     });
 
 command
+    .command('api-docs')
+    .description('run api-docs integration tests')
+    .option('--with-server')
+    .action(async (cmd: Command) => {
+        cmd.withServer ? await withServer(apiDocs, 240) : await apiDocs();
+    });
+
+command
     .command('testkit [mode]')
     .description('run testkit tests')
-    .action(async (mode?: string) => {
-        mode = mode || 'fast';
-        if (mode != 'fast' && mode != 'block-sizes') {
-            throw new Error('modes are either "fast" or "block-sizes"');
+    .option('--offline')
+    .action(async (mode?: string, offline: boolean = false) => {
+        if (offline) {
+            process.env.SQLX_OFFLINE = 'true';
         }
-        await testkit(mode, 600);
+        mode = mode || 'fast';
+        await testkit(mode, 6000);
+
+        if (offline) {
+            delete process.env.SQLX_OFFLINE;
+        }
     });

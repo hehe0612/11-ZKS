@@ -1,62 +1,62 @@
 use std::collections::HashMap;
-use zksync::{tokens_cache::TokensCache, utils::*, web3::types::H160, zksync_types::Token};
+use zksync::{tokens_cache::TokensCache, utils::*, web3::types::H160};
 use zksync_config::test_config::unit_vectors::{Config as TestVectorsConfig, TestEntry};
 use zksync_crypto::PrivateKey;
-use zksync_types::tx::TxSignature;
+use zksync_types::{tx::TxSignature, AccountId, Nonce, Token, TokenId, TokenKind};
 
 #[test]
 fn test_tokens_cache() {
     let mut tokens: HashMap<String, Token> = HashMap::default();
 
-    let token_eth = Token::new(0, H160::default(), "ETH", 18);
+    let token_eth = Token::new(TokenId(0), H160::default(), "ETH", 18, TokenKind::ERC20);
     tokens.insert("ETH".to_string(), token_eth.clone());
-    let token_dai = Token::new(1, H160::random(), "DAI", 18);
+    let token_dai = Token::new(TokenId(1), H160::random(), "DAI", 18, TokenKind::ERC20);
     tokens.insert("DAI".to_string(), token_dai.clone());
 
-    let uncahed_token = Token::new(2, H160::random(), "UNC", 5);
+    let unknown_token = Token::new(TokenId(2), H160::random(), "UNC", 5, TokenKind::None);
 
-    let tokens_hash = TokensCache::new(tokens);
+    let tokens_cache = TokensCache::new(tokens);
 
     assert_eq!(
-        tokens_hash.resolve(token_eth.address.into()),
+        tokens_cache.resolve(token_eth.address.into()),
         Some(token_eth.clone())
     );
     assert_eq!(
-        tokens_hash.resolve(token_eth.id.into()),
+        tokens_cache.resolve(token_eth.id.into()),
         Some(token_eth.clone())
     );
     assert_eq!(
-        tokens_hash.resolve((&token_eth.symbol as &str).into()),
+        tokens_cache.resolve((&token_eth.symbol as &str).into()),
         Some(token_eth.clone())
     );
 
     assert_eq!(
-        tokens_hash.resolve(token_dai.address.into()),
+        tokens_cache.resolve(token_dai.address.into()),
         Some(token_dai.clone())
     );
     assert_eq!(
-        tokens_hash.resolve(token_dai.id.into()),
+        tokens_cache.resolve(token_dai.id.into()),
         Some(token_dai.clone())
     );
     assert_eq!(
-        tokens_hash.resolve((&token_dai.symbol as &str).into()),
+        tokens_cache.resolve((&token_dai.symbol as &str).into()),
         Some(token_dai.clone())
     );
 
-    assert_eq!(tokens_hash.resolve(uncahed_token.address.into()), None);
-    assert_eq!(tokens_hash.resolve(uncahed_token.id.into()), None);
+    assert_eq!(tokens_cache.resolve(unknown_token.address.into()), None);
+    assert_eq!(tokens_cache.resolve(unknown_token.id.into()), None);
     assert_eq!(
-        tokens_hash.resolve((&uncahed_token.symbol as &str).into()),
+        tokens_cache.resolve((&unknown_token.symbol as &str).into()),
         None
     );
 
-    assert!(tokens_hash.is_eth(token_eth.address.into()));
-    assert!(tokens_hash.is_eth(token_eth.id.into()));
-    assert!(tokens_hash.is_eth((&token_eth.symbol as &str).into()));
+    assert!(tokens_cache.is_eth(token_eth.address.into()));
+    assert!(tokens_cache.is_eth(token_eth.id.into()));
+    assert!(tokens_cache.is_eth((&token_eth.symbol as &str).into()));
 
-    assert!(!tokens_hash.is_eth(token_dai.address.into()));
-    assert!(!tokens_hash.is_eth(token_dai.id.into()));
-    assert!(!tokens_hash.is_eth((&token_dai.symbol as &str).into()));
+    assert!(!tokens_cache.is_eth(token_dai.address.into()));
+    assert!(!tokens_cache.is_eth(token_dai.id.into()));
+    assert!(!tokens_cache.is_eth((&token_dai.symbol as &str).into()));
 }
 
 fn priv_key_from_raw(raw: &[u8]) -> Option<PrivateKey> {
@@ -190,12 +190,13 @@ mod signatures_with_vectors {
                 )
                 .await;
 
-                let token = Token {
-                    id: transfer_tx.token_id,
-                    address: Default::default(),
-                    symbol: sign_data.string_token.clone(),
-                    decimals: 0,
-                };
+                let token = Token::new(
+                    transfer_tx.token_id,
+                    Default::default(),
+                    &sign_data.string_token,
+                    0,
+                    TokenKind::ERC20,
+                );
                 let (transfer, eth_signature) = signer
                     .sign_transfer(
                         token,
@@ -203,6 +204,7 @@ mod signatures_with_vectors {
                         transfer_tx.fee.clone(),
                         sign_data.to,
                         sign_data.nonce,
+                        transfer_tx.time_range,
                     )
                     .await
                     .expect("Transfer signing error");
@@ -215,7 +217,9 @@ mod signatures_with_vectors {
                 );
 
                 assert_eq!(
-                    transfer.get_ethereum_sign_message(&sign_data.string_token, 0),
+                    transfer
+                        .get_ethereum_sign_message(&sign_data.string_token, 0)
+                        .into_bytes(),
                     outputs.eth_sign_message.unwrap()
                 );
 
@@ -243,12 +247,13 @@ mod signatures_with_vectors {
                 )
                 .await;
 
-                let token = Token {
-                    id: withdraw_tx.token_id,
-                    address: Default::default(),
-                    symbol: sign_data.string_token.clone(),
-                    decimals: 0,
-                };
+                let token = Token::new(
+                    withdraw_tx.token_id,
+                    Default::default(),
+                    &sign_data.string_token,
+                    0,
+                    TokenKind::ERC20,
+                );
                 let (withdraw, eth_signature) = signer
                     .sign_withdraw(
                         token,
@@ -256,6 +261,7 @@ mod signatures_with_vectors {
                         withdraw_tx.fee.clone(),
                         sign_data.eth_address,
                         sign_data.nonce,
+                        withdraw_tx.time_range,
                     )
                     .await
                     .expect("Withdraw signing error");
@@ -268,7 +274,124 @@ mod signatures_with_vectors {
                 );
 
                 assert_eq!(
-                    withdraw.get_ethereum_sign_message(&sign_data.string_token, 0),
+                    withdraw
+                        .get_ethereum_sign_message(&sign_data.string_token, 0)
+                        .into_bytes(),
+                    outputs.eth_sign_message.unwrap()
+                );
+
+                if let Some(expected_eth_signature) = outputs.eth_signature {
+                    let eth_signature = eth_signature.unwrap().serialize_packed();
+                    assert_eq!(&eth_signature[..], expected_eth_signature.as_slice());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_withdraw_nft_signature() {
+        let test_vectors = TestVectorsConfig::load();
+        for TestEntry { inputs, outputs } in test_vectors.transactions.items {
+            if let TxData::WithdrawNFT {
+                data: withdraw_nft_tx,
+                eth_sign_data: sign_data,
+            } = &inputs.data
+            {
+                let signer = get_signer(
+                    &inputs.eth_private_key,
+                    withdraw_nft_tx.from,
+                    withdraw_nft_tx.account_id,
+                )
+                .await;
+
+                let fee_token = Token::new(
+                    withdraw_nft_tx.fee_token_id,
+                    Default::default(),
+                    &sign_data.string_fee_token,
+                    0,
+                    TokenKind::ERC20,
+                );
+
+                let (withdraw_nft, eth_signature) = signer
+                    .sign_withdraw_nft(
+                        withdraw_nft_tx.to,
+                        withdraw_nft_tx.token_id,
+                        fee_token,
+                        withdraw_nft_tx.fee.clone(),
+                        withdraw_nft_tx.nonce,
+                        withdraw_nft_tx.time_range,
+                    )
+                    .await
+                    .expect("Withdraw nft signing error");
+
+                assert_eq!(withdraw_nft.get_bytes(), outputs.sign_bytes);
+                assert_tx_signature(
+                    &withdraw_nft.signature,
+                    &outputs.signature.pub_key,
+                    &outputs.signature.signature,
+                );
+
+                assert_eq!(
+                    withdraw_nft
+                        .get_ethereum_sign_message(&sign_data.string_fee_token, 0)
+                        .into_bytes(),
+                    outputs.eth_sign_message.unwrap()
+                );
+
+                if let Some(expected_eth_signature) = outputs.eth_signature {
+                    let eth_signature = eth_signature.unwrap().serialize_packed();
+                    assert_eq!(&eth_signature[..], expected_eth_signature.as_slice());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_mint_nft_signature() {
+        let test_vectors = TestVectorsConfig::load();
+        for TestEntry { inputs, outputs } in test_vectors.transactions.items {
+            if let TxData::MintNFT {
+                data: mint_nft_tx,
+                eth_sign_data: sign_data,
+            } = &inputs.data
+            {
+                let signer = get_signer(
+                    &inputs.eth_private_key,
+                    mint_nft_tx.creator_address,
+                    mint_nft_tx.creator_id,
+                )
+                .await;
+
+                let fee_token = Token::new(
+                    mint_nft_tx.fee_token_id,
+                    Default::default(),
+                    &sign_data.string_fee_token,
+                    0,
+                    TokenKind::ERC20,
+                );
+
+                let (mint_nft, eth_signature) = signer
+                    .sign_mint_nft(
+                        mint_nft_tx.recipient,
+                        mint_nft_tx.content_hash,
+                        fee_token,
+                        mint_nft_tx.fee.clone(),
+                        mint_nft_tx.nonce,
+                    )
+                    .await
+                    .expect("Withdraw nft signing error");
+
+                assert_eq!(mint_nft.get_bytes(), outputs.sign_bytes);
+                assert_tx_signature(
+                    &mint_nft.signature,
+                    &outputs.signature.pub_key,
+                    &outputs.signature.signature,
+                );
+
+                assert_eq!(
+                    mint_nft
+                        .get_ethereum_sign_message(&sign_data.string_fee_token, 0)
+                        .into_bytes(),
                     outputs.eth_sign_message.unwrap()
                 );
 
@@ -297,18 +420,20 @@ mod signatures_with_vectors {
                 .await;
                 signer.pubkey_hash = change_pubkey_tx.new_pk_hash;
 
-                let token = Token {
-                    id: change_pubkey_tx.fee_token_id,
-                    address: Default::default(),
-                    symbol: String::new(),
-                    decimals: 0,
-                };
+                let token = Token::new(
+                    change_pubkey_tx.fee_token_id,
+                    Default::default(),
+                    "",
+                    0,
+                    TokenKind::ERC20,
+                );
                 let change_pub_key = signer
                     .sign_change_pubkey_tx(
                         sign_data.nonce,
                         false,
                         token,
                         change_pubkey_tx.fee.clone(),
+                        change_pubkey_tx.time_range,
                     )
                     .await
                     .expect("Change pub key signing error");
@@ -322,15 +447,15 @@ mod signatures_with_vectors {
 
                 assert_eq!(
                     change_pub_key.get_eth_signed_data().unwrap(),
-                    outputs.eth_sign_message.unwrap().into_bytes()
+                    outputs.eth_sign_message.unwrap()
                 );
 
                 if let Some(expected_eth_signature) = outputs.eth_signature {
                     let eth_signature = match &change_pub_key.eth_auth_data {
-                        ChangePubKeyEthAuthData::ECDSA(ChangePubKeyECDSAData {
+                        Some(ChangePubKeyEthAuthData::ECDSA(ChangePubKeyECDSAData {
                             eth_signature,
                             ..
-                        }) => eth_signature.serialize_packed(),
+                        })) => eth_signature.serialize_packed(),
                         _ => panic!("No ChangePubKey ethereum siganture"),
                     };
                     assert_eq!(&eth_signature[..], expected_eth_signature.as_slice());
@@ -351,18 +476,20 @@ mod signatures_with_vectors {
                 )
                 .await;
 
-                let token = Token {
-                    id: forced_exit.token_id,
-                    address: Default::default(),
-                    symbol: String::new(),
-                    decimals: 0,
-                };
-                let forced_exit = signer
+                let token = Token::new(
+                    forced_exit.token_id,
+                    Default::default(),
+                    "",
+                    0,
+                    TokenKind::ERC20,
+                );
+                let (forced_exit, _) = signer
                     .sign_forced_exit(
                         forced_exit.target,
                         token,
                         forced_exit.fee.clone(),
                         forced_exit.nonce,
+                        forced_exit.time_range,
                     )
                     .await
                     .expect("Forced exit signing error");
@@ -387,7 +514,8 @@ mod wallet_tests {
         provider::Provider,
         signer::Signer,
         types::{
-            AccountInfo, AccountState, BlockStatus, ContractAddress, Fee, Tokens, TransactionInfo,
+            AccountInfo, AccountState, BlockStatus, ContractAddress, EthOpInfo, Fee, Tokens,
+            TransactionInfo,
         },
         Network, Wallet, WalletCredentials,
     };
@@ -395,7 +523,7 @@ mod wallet_tests {
     use zksync_types::{
         tokens::get_genesis_token_list,
         tx::{PackedEthSignature, TxHash},
-        Address, PubKeyHash, TokenLike, TxFeeTypes, ZkSyncTx, H256,
+        Address, PubKeyHash, TokenId, TokenLike, TxFeeTypes, ZkSyncTx, H256,
     };
 
     #[derive(Debug, Clone)]
@@ -435,12 +563,13 @@ mod wallet_tests {
 
             Ok(AccountInfo {
                 address,
-                id: Some(42),
+                id: Some(AccountId(42)),
                 depositing: Default::default(),
                 committed: AccountState {
                     balances: committed_balances,
-                    nonce: 0,
+                    nonce: Nonce(0),
                     pub_key_hash: self.pub_key_hash().await,
+                    ..Default::default()
                 },
                 verified: AccountState {
                     balances: verified_balances,
@@ -457,13 +586,14 @@ mod wallet_tests {
 
             let tokens = (1..)
                 .zip(&genesis_tokens[..3])
-                .map(|(id, token)| Token {
-                    id,
-                    symbol: token.symbol.clone(),
-                    address: token.address[2..]
-                        .parse()
-                        .expect("failed to parse token address"),
-                    decimals: token.decimals,
+                .map(|(id, token)| {
+                    Token::new(
+                        TokenId(id),
+                        token.address,
+                        &token.symbol,
+                        token.decimals,
+                        TokenKind::ERC20,
+                    )
                 })
                 .map(|token| (token.symbol.clone(), token))
                 .collect();
@@ -483,16 +613,24 @@ mod wallet_tests {
             unreachable!()
         }
 
-        async fn send_tx(
+        async fn get_txs_batch_fee(
             &self,
-            _tx: ZkSyncTx,
-            _eth_signature: Option<PackedEthSignature>,
-        ) -> Result<TxHash, ClientError> {
+            _tx_types: Vec<TxFeeTypes>,
+            _addresses: Vec<Address>,
+            _token: impl Into<TokenLike> + Send + 'async_trait,
+        ) -> Result<BigUint, ClientError> {
             unreachable!()
         }
 
-        fn network(&self) -> Network {
-            self.network
+        async fn ethop_info(&self, _serial_id: u32) -> Result<EthOpInfo, ClientError> {
+            unreachable!()
+        }
+
+        async fn get_eth_tx_for_withdrawal(
+            &self,
+            _withdrawal_hash: TxHash,
+        ) -> Result<Option<String>, ClientError> {
+            unreachable!()
         }
 
         /// Returns the example `ContractAddress` instance:
@@ -503,6 +641,26 @@ mod wallet_tests {
                 main_contract: "0x000102030405060708090a0b0c0d0e0f10111213".to_string(),
                 gov_contract: "".to_string(),
             })
+        }
+
+        async fn send_tx(
+            &self,
+            _tx: ZkSyncTx,
+            _eth_signature: Option<PackedEthSignature>,
+        ) -> Result<TxHash, ClientError> {
+            unreachable!()
+        }
+
+        async fn send_txs_batch(
+            &self,
+            _txs_signed: Vec<(ZkSyncTx, Option<PackedEthSignature>)>,
+            _eth_signature: Option<PackedEthSignature>,
+        ) -> Result<Vec<TxHash>, ClientError> {
+            unreachable!()
+        }
+
+        fn network(&self) -> Network {
+            self.network
         }
     }
 
@@ -543,7 +701,7 @@ mod wallet_tests {
     #[tokio::test]
     async fn test_wallet_account_id() {
         let wallet = get_test_wallet(&[14; 32], Network::Mainnet).await;
-        assert_eq!(wallet.account_id(), Some(42));
+        assert_eq!(wallet.account_id(), Some(AccountId(42)));
     }
 
     #[tokio::test]

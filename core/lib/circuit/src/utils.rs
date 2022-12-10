@@ -22,7 +22,10 @@ use zksync_crypto::{
     circuit::utils::le_bit_vector_into_field_element, params as franklin_constants, primitives::*,
 };
 // Local deps
-use crate::operation::{SignatureData, TransactionSignature};
+use crate::{
+    element::CircuitElement,
+    operation::{SignatureData, TransactionSignature},
+};
 
 pub fn reverse_bytes<T: Clone>(bits: &[T]) -> Vec<T> {
     bits.chunks(8)
@@ -45,10 +48,10 @@ where
 {
     let message_bytes = BitConvert::into_bytes(msg_data.to_vec());
 
-    let seed = Seed::deterministic_seed(&private_key, &message_bytes);
+    let seed = Seed::deterministic_seed(private_key, &message_bytes);
     let signature = private_key.musig_sha256_sign(&message_bytes, &seed, p_g, params);
 
-    let pk = PublicKey::from_private(&private_key, p_g, params);
+    let pk = PublicKey::from_private(private_key, p_g, params);
     let _is_valid_signature = pk.verify_musig_sha256(&message_bytes, &signature, p_g, params);
 
     // TODO: handle the case where it is not valid (ZKS-101)
@@ -56,9 +59,9 @@ where
     //     return None;
     // }
     let (sig_r_x, sig_r_y) = signature.r.into_xy();
-    log::debug!("signature.s: {}", signature.s);
-    log::debug!("signature.r.x: {}", sig_r_x);
-    log::debug!("signature.r.y: {}", sig_r_y);
+    vlog::debug!("signature.s: {}", signature.s);
+    vlog::debug!("signature.r.x: {}", sig_r_x);
+    vlog::debug!("signature.r.y: {}", sig_r_y);
 
     convert_signature_to_representation(signature)
 }
@@ -75,11 +78,11 @@ where
 {
     let message_bytes = BitConvert::into_bytes(msg_data.to_vec());
 
-    let seed = Seed::deterministic_seed(&private_key, &message_bytes);
+    let seed = Seed::deterministic_seed(private_key, &message_bytes);
     let signature =
         private_key.musig_rescue_sign(&message_bytes, &seed, p_g, rescue_params, jubjub_params);
 
-    let pk = PublicKey::from_private(&private_key, p_g, jubjub_params);
+    let pk = PublicKey::from_private(private_key, p_g, jubjub_params);
     let _is_valid_signature = pk.verify_musig_rescue(
         &message_bytes,
         &signature,
@@ -93,9 +96,9 @@ where
     //     return None;
     // }
     let (sig_r_x, sig_r_y) = signature.r.into_xy();
-    log::debug!("signature.s: {}", signature.s);
-    log::debug!("signature.r.x: {}", sig_r_x);
-    log::debug!("signature.r.y: {}", sig_r_y);
+    vlog::debug!("signature.s: {}", signature.s);
+    vlog::debug!("signature.r.x: {}", sig_r_x);
+    vlog::debug!("signature.r.y: {}", sig_r_y);
 
     convert_signature_to_representation(signature)
 }
@@ -129,8 +132,8 @@ where
         false,
     );
     signature_r_y_be_bits.reverse();
-    let mut sig_r_packed_bits = vec![];
-    sig_r_packed_bits.push(signature_r_x_be_bits[franklin_constants::FR_BIT_WIDTH_PADDED - 1]);
+    let mut sig_r_packed_bits =
+        vec![signature_r_x_be_bits[franklin_constants::FR_BIT_WIDTH_PADDED - 1]];
     sig_r_packed_bits.extend(signature_r_y_be_bits[1..].iter());
     let sig_r_packed_bits = reverse_bytes(&sig_r_packed_bits);
 
@@ -172,10 +175,10 @@ where
         message_bytes.push(byte);
     }
 
-    let seed = Seed::deterministic_seed(&private_key, &message_bytes);
+    let seed = Seed::deterministic_seed(private_key, &message_bytes);
     let signature = private_key.musig_sha256_sign(&message_bytes, &seed, p_g, params);
 
-    let pk = PublicKey::from_private(&private_key, p_g, params);
+    let pk = PublicKey::from_private(private_key, p_g, params);
     let is_valid_signature = pk.verify_musig_sha256(&message_bytes, &signature, p_g, params);
     if !is_valid_signature {
         return None;
@@ -240,7 +243,7 @@ pub fn pack_bits_to_element<E: Engine, CS: ConstraintSystem<E>>(
     let mut data_from_lc = Num::<E>::zero();
     let mut coeff = E::Fr::one();
     for bit in bits {
-        data_from_lc = data_from_lc.add_bool_with_coeff(CS::one(), &bit, coeff);
+        data_from_lc = data_from_lc.add_bool_with_coeff(CS::one(), bit, coeff);
         coeff.double();
     }
 
@@ -281,7 +284,7 @@ where
 {
     let mut counter = Num::zero();
     for bit in a.iter() {
-        counter = counter.add_bool_with_coeff(CS::one(), &bit, E::Fr::one());
+        counter = counter.add_bool_with_coeff(CS::one(), bit, E::Fr::one());
     }
 
     let result = AllocatedNum::alloc(cs.namespace(|| "number of zeroes number"), || {
@@ -373,12 +376,7 @@ pub fn boolean_or<E: Engine, CS: ConstraintSystem<E>>(
     y: &Boolean,
 ) -> Result<Boolean, SynthesisError> {
     // A OR B = ( A NAND A ) NAND ( B NAND B ) = (NOT(A)) NAND (NOT (B))
-    let result = Boolean::and(
-        cs.namespace(|| "lhs_valid nand rhs_valid"),
-        &x.not(),
-        &y.not(),
-    )?
-    .not();
+    let result = Boolean::and(cs.namespace(|| "x.not() nand y.not()"), &x.not(), &y.not())?.not();
 
     Ok(result)
 }
@@ -431,7 +429,7 @@ pub fn vectorized_compare<E: Engine, CS: ConstraintSystem<E>>(
     old_data: &[AllocatedNum<E>],
     new_bits: &[Boolean],
 ) -> Result<(Boolean, Vec<AllocatedNum<E>>), SynthesisError> {
-    let packed = multipack::pack_into_witness(cs.namespace(|| "pack claimed data"), &new_bits)?;
+    let packed = multipack::pack_into_witness(cs.namespace(|| "pack claimed data"), new_bits)?;
 
     assert_eq!(packed.len(), old_data.len());
 
@@ -442,8 +440,8 @@ pub fn vectorized_compare<E: Engine, CS: ConstraintSystem<E>>(
     for (i, (old, new)) in old_data.iter().zip(packed.iter()).enumerate() {
         let is_equal_bit = AllocatedNum::<E>::equals(
             cs.namespace(|| format!("equality for chunk {}", i)),
-            &old,
-            &new,
+            old,
+            new,
         )?;
 
         let equal_bool = Boolean::from(is_equal_bit);
@@ -453,4 +451,38 @@ pub fn vectorized_compare<E: Engine, CS: ConstraintSystem<E>>(
     let is_equal = multi_and(cs.namespace(|| "all data is equal"), &equality_bits)?;
 
     Ok((is_equal, packed))
+}
+
+pub fn sequences_equal<E: Engine, CS: ConstraintSystem<E>>(
+    mut cs: CS,
+    lhs: &[CircuitElement<E>],
+    rhs: &[CircuitElement<E>],
+) -> Result<Boolean, SynthesisError> {
+    assert_eq!(lhs.len(), rhs.len());
+    let equality_flags = lhs
+        .iter()
+        .zip(rhs.iter())
+        .enumerate()
+        .map(|(idx, (lhs, rhs))| {
+            CircuitElement::equals(
+                cs.namespace(|| format!("element with index {}", idx)),
+                lhs,
+                rhs,
+            )
+        })
+        .collect::<Result<Vec<_>, SynthesisError>>()?;
+    multi_and(cs, &equality_flags)
+}
+
+pub fn u8_into_bits_be(a: u8) -> Vec<Boolean> {
+    let mut res = Vec::new();
+    for i in 0..8 {
+        if (a & (1u8 << (7 - i))) != 0 {
+            res.push(Boolean::constant(true));
+        } else {
+            res.push(Boolean::constant(false));
+        }
+    }
+
+    res
 }

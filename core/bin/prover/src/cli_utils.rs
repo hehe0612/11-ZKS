@@ -3,16 +3,18 @@ use std::time::Duration;
 // External deps
 use structopt::StructOpt;
 // Workspace deps
-use zksync_config::ProverOptions;
+use zksync_config::configs::ProverConfig as EnvProverConfig;
 use zksync_utils::{get_env, parse_env};
 // Local deps
 use crate::{client, prover_work_cycle, ProverConfig, ProverImpl, ShutdownRequest};
+use zksync_config::configs::api::PrometheusConfig;
+use zksync_prometheus_exporter::run_prometheus_exporter;
 
-fn api_client_from_env(worker_name: &str) -> client::ApiClient {
-    let server_api_url = parse_env("PROVER_SERVER_URL");
-    let request_timout = Duration::from_secs(parse_env::<u64>("REQ_SERVER_TIMEOUT"));
-    let secret = get_env("PROVER_SECRET_AUTH");
-    client::ApiClient::new(&server_api_url, worker_name, request_timout, &secret)
+fn api_client_from_env() -> client::ApiClient {
+    let server_api_url = parse_env("API_PROVER_URL");
+    let request_timout = Duration::from_secs(parse_env::<u64>("PROVER_PROVER_REQUEST_TIMEOUT"));
+    let secret = get_env("API_PROVER_SECRET_AUTH");
+    client::ApiClient::new(&server_api_url, request_timout, &secret)
 }
 
 #[derive(StructOpt)]
@@ -27,20 +29,24 @@ struct Opt {
     worker_name: String,
 }
 
-pub async fn main_for_prover_impl<P: ProverImpl + 'static + Send + Sync>() {
+pub async fn main_for_prover_impl<PROVER>(run_prometheus: bool)
+where
+    PROVER: ProverImpl + Send + Sync + 'static,
+{
     let opt = Opt::from_args();
     let worker_name = opt.worker_name;
 
     // used env
-    let prover_config = <P as ProverImpl>::Config::from_env();
-    let api_client = api_client_from_env(&worker_name);
-    let prover = P::create_from_config(prover_config);
+    let prover_options = EnvProverConfig::from_env();
+    let prover_config = <PROVER as ProverImpl>::Config::from_env();
+    let api_client = api_client_from_env();
+    let prover = PROVER::create_from_config(prover_config);
 
-    env_logger::init();
+    let _vlog_guard = vlog::init();
 
-    log::info!("creating prover, worker name: {}", worker_name);
+    vlog::info!("creating prover, worker name: {}", worker_name);
 
-    // Create client
+    // Create client.
 
     let shutdown_request = ShutdownRequest::new();
 
@@ -48,12 +54,12 @@ pub async fn main_for_prover_impl<P: ProverImpl + 'static + Send + Sync>() {
     {
         let shutdown_request = shutdown_request.clone();
         ctrlc::set_handler(move || {
-            log::info!(
+            vlog::info!(
                 "Termination signal received. It will be handled after the currently working round"
             );
 
             if shutdown_request.get() {
-                log::warn!("Second shutdown request received, shutting down without waiting for round to be completed");
+                vlog::warn!("Second shutdown request received, shutting down without waiting for round to be completed");
                 std::process::exit(0);
             }
 
@@ -62,6 +68,17 @@ pub async fn main_for_prover_impl<P: ProverImpl + 'static + Send + Sync>() {
         .expect("Failed to register ctrlc handler");
     }
 
-    let prover_options = ProverOptions::from_env();
-    prover_work_cycle(prover, api_client, shutdown_request, prover_options).await;
+    if run_prometheus {
+        let prom_config = PrometheusConfig::from_env();
+        run_prometheus_exporter(prom_config.port);
+    }
+
+    prover_work_cycle(
+        prover,
+        api_client,
+        shutdown_request,
+        prover_options,
+        &worker_name,
+    )
+    .await;
 }

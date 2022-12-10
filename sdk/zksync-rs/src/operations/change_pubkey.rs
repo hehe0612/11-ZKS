@@ -3,12 +3,14 @@ use zksync_eth_signer::EthereumSigner;
 use zksync_types::{
     helpers::{closest_packable_fee_amount, is_fee_amount_packable},
     tokens::TxFeeTypes,
+    tx::ChangePubKeyType,
     Nonce, Token, TokenLike, ZkSyncTx,
 };
 
 use crate::{
     error::ClientError, operations::SyncTransactionHandle, provider::Provider, wallet::Wallet,
 };
+use zksync_types::tokens::ChangePubKeyFeeTypeArg;
 
 #[derive(Debug)]
 pub struct ChangePubKeyBuilder<'a, S: EthereumSigner, P: Provider> {
@@ -17,11 +19,13 @@ pub struct ChangePubKeyBuilder<'a, S: EthereumSigner, P: Provider> {
     fee_token: Option<Token>,
     fee: Option<BigUint>,
     nonce: Option<Nonce>,
+    valid_from: Option<u32>,
+    valid_until: Option<u32>,
 }
 
 impl<'a, S, P> ChangePubKeyBuilder<'a, S, P>
 where
-    S: EthereumSigner + Clone,
+    S: EthereumSigner,
     P: Provider + Clone,
 {
     /// Initializes a change public key transaction building process.
@@ -32,10 +36,12 @@ where
             fee_token: None,
             fee: None,
             nonce: None,
+            valid_from: None,
+            valid_until: None,
         }
     }
 
-    /// Sends the transaction, returning the handle for its awaiting.
+    /// Directly returns the signed change pubkey transaction for the subsequent usage.
     pub async fn tx(self) -> Result<ZkSyncTx, ClientError> {
         let fee_token = self
             .fee_token
@@ -48,8 +54,14 @@ where
                     .wallet
                     .provider
                     .get_tx_fee(
-                        TxFeeTypes::ChangePubKey {
-                            onchain_pubkey_auth: self.onchain_auth,
+                        if self.onchain_auth {
+                            TxFeeTypes::ChangePubKey(ChangePubKeyFeeTypeArg::ContractsV4Version(
+                                ChangePubKeyType::Onchain,
+                            ))
+                        } else {
+                            TxFeeTypes::ChangePubKey(ChangePubKeyFeeTypeArg::ContractsV4Version(
+                                ChangePubKeyType::ECDSA,
+                            ))
                         },
                         self.wallet.address(),
                         fee_token.id,
@@ -71,10 +83,12 @@ where
             }
         };
 
+        let time_range = Default::default();
+
         Ok(ZkSyncTx::from(
             self.wallet
                 .signer
-                .sign_change_pubkey_tx(nonce, self.onchain_auth, fee_token, fee)
+                .sign_change_pubkey_tx(nonce, self.onchain_auth, fee_token, fee, time_range)
                 .await
                 .map_err(ClientError::SigningError)?,
         ))
@@ -132,6 +146,18 @@ where
     /// Sets the transaction nonce.
     pub fn nonce(mut self, nonce: Nonce) -> Self {
         self.nonce = Some(nonce);
+        self
+    }
+
+    /// Sets the unix format timestamp of the first moment when transaction execution is valid.
+    pub fn valid_from(mut self, valid_from: u32) -> Self {
+        self.valid_from = Some(valid_from);
+        self
+    }
+
+    /// Sets the unix format timestamp of the last moment when transaction execution is valid.
+    pub fn valid_until(mut self, valid_until: u32) -> Self {
+        self.valid_until = Some(valid_until);
         self
     }
 }

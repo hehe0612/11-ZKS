@@ -6,18 +6,27 @@ members = [
     "core/bin/server",
     "core/bin/prover",
     "core/bin/parse_pub_data",
+    "core/bin/block_revert",
+    "core/bin/remove_proofs",
+    "core/bin/tree_cache_updater",
+    "core/bin/add_seq_no",
 
     # Server micro-services
     "core/bin/zksync_api",
     "core/bin/zksync_core",
     "core/bin/zksync_eth_sender",
+    "core/bin/zksync_event_listener",
     "core/bin/zksync_witness_generator",
-    "core/bin/zksync_prometheus_exporter",
+    "core/bin/zksync_forced_exit_requests",
 
     # Libraries
+    "core/lib/token_db_cache",
     "core/lib/circuit",
+    "core/lib/mempool",
     "core/lib/eth_client",
     "core/lib/eth_signer",
+    "core/lib/gateway_watcher",
+    "core/lib/prometheus_exporter",
     "core/lib/types",
     "core/lib/state",
     "core/lib/storage",
@@ -28,18 +37,21 @@ members = [
     "core/lib/prover_utils",
     "core/lib/config",
     "core/lib/contracts",
+    "core/lib/api_client",
+    "core/lib/notifier",
+    "core/lib/api_types",
+    "core/lib/balancer",
 
     # Test infrastructure
+    "core/tests/flamegraph_target",
     "core/tests/test_account",
     "core/tests/testkit",
-    "core/tests/loadtest",
-
-    # Infrastructure applications
-    "infrastructure/tok_cli",
+    "core/tests/loadnext",
 
     # SDK section
-    "sdk/zksync-rs",
+    "sdk/zksync-rs"
 ]
 
-[patch.crates-io]
-ethabi = { git = "https://github.com/dvush/ethabi.git" }
+[profile.release.package.flamegraph_target]
+# We need both performance and debug info to analyze.
+debug = true

@@ -1,11 +1,11 @@
 use crate::tests::{AccountState::*, PlasmaTestBuilder};
 use num::{BigUint, Zero};
-use zksync_types::{account::AccountUpdate, tx::ForcedExit};
+use zksync_types::{account::AccountUpdate, tx::ForcedExit, AccountId, TokenId};
 
 /// Check ForcedExit operation
 #[test]
 fn success() {
-    let token_id = 0;
+    let token_id = TokenId(0);
     let amount = BigUint::from(100u32);
     let fee = BigUint::from(10u32);
 
@@ -23,6 +23,7 @@ fn success() {
         token_id,
         fee.clone(),
         initiator_account.nonce,
+        Default::default(),
         &initiator_sk,
     )
     .unwrap();
@@ -53,7 +54,7 @@ fn success() {
 /// Check ForcedExit failure if target wallet is unlocked
 #[test]
 fn unlocked_target() {
-    let token_id = 0;
+    let token_id = TokenId(0);
     let amount = BigUint::from(100u32);
     let fee = BigUint::from(10u32);
 
@@ -71,6 +72,7 @@ fn unlocked_target() {
         token_id,
         fee,
         initiator_account.nonce,
+        Default::default(),
         &initiator_sk,
     )
     .unwrap();
@@ -84,7 +86,7 @@ fn unlocked_target() {
 /// Check ForcedExit failure if not enough funds
 #[test]
 fn insufficient_funds() {
-    let token_id = 0;
+    let token_id = TokenId(0);
     let amount = BigUint::from(100u32);
     let fee = BigUint::from(10u32);
 
@@ -101,6 +103,7 @@ fn insufficient_funds() {
         token_id,
         fee,
         initiator_account.nonce,
+        Default::default(),
         &initiator_sk,
     )
     .unwrap();
@@ -114,7 +117,7 @@ fn insufficient_funds() {
 /// Check ForcedExit failure if nonce is incorrect
 #[test]
 fn nonce_mismatch() {
-    let token_id = 0;
+    let token_id = TokenId(0);
     let amount = BigUint::from(100u32);
     let fee = BigUint::from(10u32);
 
@@ -132,6 +135,7 @@ fn nonce_mismatch() {
         token_id,
         fee,
         initiator_account.nonce + 42,
+        Default::default(),
         &initiator_sk,
     )
     .unwrap();
@@ -143,7 +147,7 @@ fn nonce_mismatch() {
 /// does not correspond to accound_id
 #[test]
 fn invalid_account_id() {
-    let token_id = 0;
+    let token_id = TokenId(0);
     let amount = BigUint::from(100u32);
     let fee = BigUint::from(10u32);
 
@@ -156,11 +160,12 @@ fn invalid_account_id() {
     tb.set_balance(target_account_id, token_id, amount);
 
     let forced_exit = ForcedExit::new_signed(
-        initiator_account_id + 42,
+        AccountId(*initiator_account_id + 42),
         target_account.address,
         token_id,
         fee,
         initiator_account.nonce,
+        Default::default(),
         &initiator_sk,
     )
     .unwrap();

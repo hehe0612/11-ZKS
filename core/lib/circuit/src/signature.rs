@@ -34,8 +34,7 @@ pub struct AllocatedSignatureData<E: JubjubEngine> {
 
 impl<E: JubjubEngine> AllocatedSignatureData<E> {
     pub fn get_packed_r(&self) -> Vec<Boolean> {
-        let mut r_packed_bits = vec![];
-        r_packed_bits.push(self.sig_r_x_bit.clone());
+        let mut r_packed_bits = vec![self.sig_r_x_bit.clone()];
         r_packed_bits.extend(self.sig_r_y_bits.clone());
         reverse_bytes(&r_packed_bits)
     }
@@ -71,9 +70,9 @@ pub fn unpack_point_if_possible<E: RescueEngine + JubjubEngine, CS: ConstraintSy
         cs.namespace(|| "recover_from_y_unchecked"),
         &Boolean::from(r_x_bit.clone()),
         &r_y.get_number(),
-        &jubjub_params,
+        jubjub_params,
     )?;
-    log::debug!(
+    vlog::debug!(
         "r_recovered.x={:?} \n r_recovered.y={:?}",
         r_recovered.get_x().get_value(),
         r_recovered.get_y().get_value()
@@ -83,7 +82,7 @@ pub fn unpack_point_if_possible<E: RescueEngine + JubjubEngine, CS: ConstraintSy
         cs.namespace(|| "pubkey from xy"),
         r_recovered.get_x().clone(),
         r_recovered.get_y().clone(),
-        &rescue_params,
+        rescue_params,
     )?;
 
     Ok(AllocatedSignerPubkey {
@@ -138,7 +137,7 @@ pub fn verify_circuit_signature<E: RescueEngine + JubjubEngine, CS: ConstraintSy
         cs.namespace(|| "recover_from_y_unchecked"),
         &Boolean::from(r_x_bit.clone()),
         &r_y.get_number(),
-        &jubjub_params,
+        jubjub_params,
     )?;
 
     let signature = EddsaSignature {
@@ -147,12 +146,12 @@ pub fn verify_circuit_signature<E: RescueEngine + JubjubEngine, CS: ConstraintSy
         pk: signer_key.point.clone(),
     };
 
-    log::debug!(
+    vlog::debug!(
         "signature_r_x={:?} \n signature_r_y={:?}",
         signature.r.get_x().get_value(),
         signature.r.get_y().get_value()
     );
-    log::debug!("s={:?}", signature.s.get_value());
+    vlog::debug!("s={:?}", signature.s.get_value());
 
     let serialized_tx_bits = {
         let mut temp_bits = op_data.first_sig_msg.get_bits_le();
@@ -189,9 +188,9 @@ pub fn verify_circuit_signature<E: RescueEngine + JubjubEngine, CS: ConstraintSy
         generator,
     )?;
 
-    log::debug!("is_sig_verified={:?}", is_sig_verified.get_value());
-    log::debug!("is_sig_r_correct={:?}", is_sig_r_correct.get_value());
-    log::debug!(
+    vlog::debug!("is_sig_verified={:?}", is_sig_verified.get_value());
+    vlog::debug!("is_sig_r_correct={:?}", is_sig_r_correct.get_value());
+    vlog::debug!(
         "signer_key.is_correctly_unpacked={:?}",
         signer_key.is_correctly_unpacked.get_value()
     );
@@ -229,12 +228,12 @@ pub fn verify_signature_message_construction<E: JubjubEngine, CS: ConstraintSyst
     let remaining = remaining.to_vec();
     let (second_sig_part_bits, third_sig_part_bits) = remaining.split_at(E::Fr::CAPACITY as usize);
     let first_sig_part =
-        pack_bits_to_element(cs.namespace(|| "first_sig_part"), &first_sig_part_bits)?;
+        pack_bits_to_element(cs.namespace(|| "first_sig_part"), first_sig_part_bits)?;
 
     let second_sig_part =
-        pack_bits_to_element(cs.namespace(|| "second_sig_part"), &second_sig_part_bits)?;
+        pack_bits_to_element(cs.namespace(|| "second_sig_part"), second_sig_part_bits)?;
     let third_sig_part =
-        pack_bits_to_element(cs.namespace(|| "third_sig_part"), &third_sig_part_bits)?;
+        pack_bits_to_element(cs.namespace(|| "third_sig_part"), third_sig_part_bits)?;
 
     let is_first_sig_part_correct = Boolean::from(Expression::equals(
         cs.namespace(|| "is_first_sig_part_correct"),
@@ -346,17 +345,17 @@ pub fn is_rescue_signature_verified<E: RescueEngine + JubjubEngine, CS: Constrai
     sponge.absorb(
         cs.namespace(|| "apply rescue hash on FS parameters"),
         &hash_input,
-        &rescue_params,
+        rescue_params,
     )?;
 
     let s0 = sponge.squeeze_out_single(
         cs.namespace(|| "squeeze first word form sponge"),
-        &rescue_params,
+        rescue_params,
     )?;
 
     let s1 = sponge.squeeze_out_single(
         cs.namespace(|| "squeeze second word form sponge"),
-        &rescue_params,
+        rescue_params,
     )?;
 
     let s0_bits =
@@ -371,7 +370,7 @@ pub fn is_rescue_signature_verified<E: RescueEngine + JubjubEngine, CS: Constrai
     bits.extend_from_slice(&s1_bits[0..take_bits]);
     assert!(bits.len() == E::Fs::CAPACITY as usize);
 
-    let max_message_len = 32 as usize; //since it is the result of sha256 hash
+    let max_message_len = 32_usize; //since it is the result of sha256 hash
 
     // we can use lowest bits of the challenge
     let is_sig_verified = verify_schnorr_relationship(
@@ -408,17 +407,14 @@ where
 
     // only order of R is checked. Public key and generator can be guaranteed to be in proper group!
     // by some other means for out particular case
-    let r_is_not_small_order = is_not_small_order(
-        &signature.r,
-        cs.namespace(|| "R is in right order"),
-        &params,
-    )?;
+    let r_is_not_small_order =
+        is_not_small_order(&signature.r, cs.namespace(|| "R is in right order"), params)?;
 
     let challenge = fs_challenge;
 
     let pk_mul_hash = signature
         .pk
-        .mul(cs.namespace(|| "Calculate h*PK"), &challenge, params)?;
+        .mul(cs.namespace(|| "Calculate h*PK"), challenge, params)?;
 
     let rhs = pk_mul_hash.add(cs.namespace(|| "Make signature RHS"), &signature.r, params)?;
 
@@ -438,10 +434,10 @@ where
         Expression::from(rhs_y),
         Expression::from(sb_y),
     )?);
-    Ok(multi_and(
+    multi_and(
         cs.namespace(|| "is signature correct"),
         &[r_is_not_small_order, is_x_correct, is_y_correct],
-    )?)
+    )
 }
 
 pub fn is_not_small_order<CS, E>(

@@ -1,19 +1,22 @@
 // Built-in deps
 use std::time::Instant;
 // External imports
+use chrono::{Duration, Utc};
 // Workspace imports
-use zksync_types::{tx::TxHash, ActionType, BlockNumber};
+use zksync_types::{
+    aggregated_operations::{AggregatedActionType, AggregatedOperation},
+    tx::TxHash,
+    BlockNumber, PriorityOp, SerialId, H256,
+};
 // Local imports
 use self::records::{
-    NewExecutedPriorityOperation, NewExecutedTransaction, NewOperation, StoredAggregatedOperation,
-    StoredExecutedPriorityOperation, StoredOperation,
+    NewExecutedPriorityOperation, NewExecutedTransaction, StoredAggregatedOperation,
+    StoredCompleteWithdrawalsTransaction, StoredExecutedPriorityOperation, StoredPendingWithdrawal,
 };
 use crate::chain::operations::records::StoredExecutedTransaction;
 use crate::chain::operations_ext::OperationsExtSchema;
 use crate::ethereum::EthereumSchema;
 use crate::{chain::mempool::MempoolSchema, QueryResult, StorageProcessor};
-use zksync_basic_types::H256;
-use zksync_types::aggregated_operations::{AggregatedActionType, AggregatedOperation};
 
 pub mod records;
 
@@ -24,15 +27,16 @@ pub mod records;
 pub struct OperationsSchema<'a, 'c>(pub &'a mut StorageProcessor<'c>);
 
 impl<'a, 'c> OperationsSchema<'a, 'c> {
-    pub async fn get_last_block_by_action(
+    /// Return the greatest block number with the given `action_type` and `confirmed` status.
+    pub async fn get_last_block_by_aggregated_action(
         &mut self,
-        action_type: ActionType,
+        aggregated_action_type: AggregatedActionType,
         confirmed: Option<bool>,
     ) -> QueryResult<BlockNumber> {
         let start = Instant::now();
         let max_block = sqlx::query!(
-            r#"SELECT max(block_number) FROM operations WHERE action_type = $1 AND confirmed IS DISTINCT FROM $2"#,
-            action_type.to_string(),
+            r#"SELECT max(to_block) FROM aggregate_operations WHERE action_type = $1 AND confirmed IS DISTINCT FROM $2"#,
+            aggregated_action_type.to_string(),
             confirmed.map(|value| !value)
         )
         .fetch_one(self.0.conn())
@@ -41,34 +45,39 @@ impl<'a, 'c> OperationsSchema<'a, 'c> {
         .unwrap_or(0);
 
         metrics::histogram!(
-            "sql.chain.operations.get_last_block_by_action",
+            "sql.chain.operations.get_last_block_by_aggregated_action",
             start.elapsed()
         );
-        Ok(max_block as BlockNumber)
+        Ok(BlockNumber(max_block as u32))
     }
 
-    pub async fn get_operation(
+    pub async fn get_stored_aggregated_operation(
         &mut self,
         block_number: BlockNumber,
-        action_type: ActionType,
-    ) -> Option<StoredOperation> {
+        aggregated_action_type: AggregatedActionType,
+    ) -> Option<StoredAggregatedOperation> {
         let start = Instant::now();
         let result = sqlx::query_as!(
-            StoredOperation,
-            "SELECT * FROM operations WHERE block_number = $1 AND action_type = $2",
-            i64::from(block_number),
-            action_type.to_string()
+            StoredAggregatedOperation,
+            "SELECT * FROM aggregate_operations WHERE $1 BETWEEN from_block AND to_block
+                AND action_type = $2",
+            i64::from(*block_number),
+            aggregated_action_type.to_string()
         )
         .fetch_optional(self.0.conn())
         .await
         .ok()
         .flatten();
 
-        metrics::histogram!("sql.chain.operations.get_operation", start.elapsed());
+        metrics::histogram!(
+            "sql.chain.operations.get_stored_aggregated_operations",
+            start.elapsed()
+        );
         result
     }
 
-    pub async fn get_executed_operation(
+    /// Retrieves transaction from the database given its hash.
+    pub(crate) async fn get_executed_operation(
         &mut self,
         op_hash: &[u8],
     ) -> QueryResult<Option<StoredExecutedTransaction>> {
@@ -80,7 +89,6 @@ impl<'a, 'c> OperationsSchema<'a, 'c> {
         )
         .fetch_optional(self.0.conn())
         .await?;
-
         metrics::histogram!(
             "sql.chain.operations.get_executed_operation",
             start.elapsed()
@@ -88,6 +96,7 @@ impl<'a, 'c> OperationsSchema<'a, 'c> {
         Ok(op)
     }
 
+    /// Retrieves priority operation from the database given its ID.
     pub async fn get_executed_priority_operation(
         &mut self,
         priority_op_id: u32,
@@ -108,7 +117,8 @@ impl<'a, 'c> OperationsSchema<'a, 'c> {
         Ok(op)
     }
 
-    pub async fn get_executed_priority_operation_by_hash(
+    /// Retrieves priority operation from the database by its eth_hash.
+    pub async fn get_executed_priority_operation_by_eth_hash(
         &mut self,
         eth_hash: &[u8],
     ) -> QueryResult<Option<StoredExecutedPriorityOperation>> {
@@ -122,69 +132,34 @@ impl<'a, 'c> OperationsSchema<'a, 'c> {
         .await?;
 
         metrics::histogram!(
-            "sql.chain.operations.get_executed_priority_operation_by_hash",
+            "sql.chain.operations.get_executed_priority_operation_by_eth_hash",
             start.elapsed()
         );
         Ok(op)
     }
 
-    pub(crate) async fn store_operation(
-        &mut self,
-        operation: NewOperation,
-    ) -> QueryResult<StoredOperation> {
-        let start = Instant::now();
-        let op = sqlx::query_as!(
-            StoredOperation,
-            "INSERT INTO operations (block_number, action_type) VALUES ($1, $2)
-            RETURNING *",
-            operation.block_number,
-            operation.action_type
-        )
-        .fetch_one(self.0.conn())
-        .await?;
-        metrics::histogram!("sql.chain.operations.store_operation", start.elapsed());
-        Ok(op)
-    }
-
-    pub(crate) async fn confirm_operation(
-        &mut self,
-        block_number: BlockNumber,
-        action_type: ActionType,
-    ) -> QueryResult<()> {
-        let start = Instant::now();
-        sqlx::query!(
-            "UPDATE operations
-                SET confirmed = $1
-                WHERE block_number = $2 AND action_type = $3",
-            true,
-            i64::from(block_number),
-            action_type.to_string()
-        )
-        .execute(self.0.conn())
-        .await?;
-        metrics::histogram!("sql.chain.operations.confirm_operation", start.elapsed());
-        Ok(())
-    }
-
-    pub async fn confirm_operations(
+    pub async fn confirm_aggregated_operations(
         &mut self,
         first_block: BlockNumber,
         last_block: BlockNumber,
-        action_type: ActionType,
+        action_type: AggregatedActionType,
     ) -> QueryResult<()> {
         let start = Instant::now();
         sqlx::query!(
-            "UPDATE operations
+            "UPDATE aggregate_operations
                 SET confirmed = $1
-                WHERE block_number >= $2 AND block_number <= $3 AND action_type = $4",
+                WHERE from_block >= $2 AND to_block <= $3 AND action_type = $4",
             true,
-            i64::from(first_block),
-            i64::from(last_block),
+            i64::from(*first_block),
+            i64::from(*last_block),
             action_type.to_string()
         )
         .execute(self.0.conn())
         .await?;
-        metrics::histogram!("sql.chain.operations.confirm_operations", start.elapsed());
+        metrics::histogram!(
+            "sql.chain.operations.confirm_aggregated_operations",
+            start.elapsed()
+        );
         Ok(())
     }
 
@@ -200,19 +175,20 @@ impl<'a, 'c> OperationsSchema<'a, 'c> {
             .remove_tx(&operation.tx_hash)
             .await?;
 
-        if operation.success {
+        let sequence_number: Option<i64> = if operation.success {
             // If transaction succeed, it should replace the stored tx with the same hash.
             // The situation when a duplicate tx is stored in the database may exist only if has
             // failed previously.
             // Possible scenario: user had no enough funds for transfer, then deposited some and
             // sent the same transfer again.
-
             sqlx::query!(
                 "INSERT INTO executed_transactions (block_number, block_index, tx, operation, tx_hash, from_account, to_account, success, fail_reason, primary_account_address, nonce, created_at, eth_sign_data, batch_id)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
                 ON CONFLICT (tx_hash)
                 DO UPDATE
-                SET block_number = $1, block_index = $2, tx = $3, operation = $4, tx_hash = $5, from_account = $6, to_account = $7, success = $8, fail_reason = $9, primary_account_address = $10, nonce = $11, created_at = $12, eth_sign_data = $13, batch_id = $14",
+                SET block_number = $1, block_index = $2, tx = $3, operation = $4, tx_hash = $5, from_account = $6, to_account = $7, success = $8, fail_reason = $9, primary_account_address = $10, nonce = $11, created_at = $12, eth_sign_data = $13, batch_id = $14
+                RETURNING sequence_number
+                ",
                 operation.block_number,
                 operation.block_index,
                 operation.tx,
@@ -228,15 +204,18 @@ impl<'a, 'c> OperationsSchema<'a, 'c> {
                 operation.eth_sign_data,
                 operation.batch_id,
             )
-            .execute(transaction.conn())
-            .await?;
+            .fetch_optional(transaction.conn())
+            .await?.map(|a| a.sequence_number).flatten()
         } else {
             // If transaction failed, we do nothing on conflict.
             sqlx::query!(
-                "INSERT INTO executed_transactions (block_number, block_index, tx, operation, tx_hash, from_account, to_account, success, fail_reason, primary_account_address, nonce, created_at, eth_sign_data, batch_id)
+                "
+                INSERT INTO executed_transactions (block_number, block_index, tx, operation, tx_hash, from_account, to_account, success, fail_reason, primary_account_address, nonce, created_at, eth_sign_data, batch_id)
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
                 ON CONFLICT (tx_hash)
-                DO NOTHING",
+                DO NOTHING
+                RETURNING sequence_number
+                ",
                 operation.block_number,
                 operation.block_index,
                 operation.tx,
@@ -252,12 +231,82 @@ impl<'a, 'c> OperationsSchema<'a, 'c> {
                 operation.eth_sign_data,
                 operation.batch_id,
             )
+            .fetch_optional(transaction.conn())
+            .await?.map(|a| a.sequence_number).flatten()
+        };
+        if let Some(seq_no) = sequence_number {
+            let mut addresses = Vec::new();
+            let mut tokens = Vec::new();
+            for address in operation.affected_accounts {
+                for token in operation.used_tokens.iter() {
+                    addresses.push(address.clone());
+                    tokens.push(*token);
+                }
+            }
+            sqlx::query!(
+                "
+                INSERT INTO tx_filters (address, token, tx_hash, sequence_number, is_priority)
+                SELECT u.address, u.token, $3, $4, false
+                    FROM UNNEST ($1::bytea[], $2::integer[])
+                    AS u(address, token)
+                ON CONFLICT ON CONSTRAINT tx_filters_pkey DO NOTHING
+                ",
+                &addresses,
+                &tokens,
+                &operation.tx_hash,
+                &seq_no
+            )
             .execute(transaction.conn())
             .await?;
-        };
-
+        }
         transaction.commit().await?;
         metrics::histogram!("sql.chain.operations.store_executed_tx", start.elapsed());
+        // It's almost impossible situation, but it could be triggered in tests
+        let tx_duration = (Utc::now() - operation.created_at)
+            .to_std()
+            .unwrap_or_default();
+        metrics::histogram!("process_tx", tx_duration, "stage" => "execute");
+        Ok(())
+    }
+
+    /// Removes all rejected transactions with an age greater than `max_age` from the database.
+    pub async fn remove_rejected_transactions(&mut self, max_age: Duration) -> QueryResult<()> {
+        let start = Instant::now();
+
+        let mut transaction = self.0.start_transaction().await?;
+        let offset = Utc::now() - max_age;
+        let tx_hashes: Vec<Vec<u8>> = sqlx::query!(
+            r#"
+            SELECT tx_hash FROM executed_transactions 
+            WHERE success = false AND created_at < $1 LIMIT 1000
+            "#,
+            offset
+        )
+        .fetch_all(transaction.conn())
+        .await?
+        .into_iter()
+        .map(|value| value.tx_hash)
+        .collect();
+
+        sqlx::query!(
+            "DELETE FROM executed_transactions WHERE tx_hash = ANY ($1)",
+            &tx_hashes
+        )
+        .execute(transaction.conn())
+        .await?;
+        sqlx::query!(
+            "DELETE FROM tx_filters WHERE tx_hash = ANY ($1)",
+            &tx_hashes
+        )
+        .execute(transaction.conn())
+        .await?;
+
+        transaction.commit().await?;
+
+        metrics::histogram!(
+            "sql.chain.operations.remove_rejected_transactions",
+            start.elapsed()
+        );
         Ok(())
     }
 
@@ -271,11 +320,20 @@ impl<'a, 'c> OperationsSchema<'a, 'c> {
         operation: NewExecutedPriorityOperation,
     ) -> QueryResult<()> {
         let start = Instant::now();
-        sqlx::query!(
-            "INSERT INTO executed_priority_operations (block_number, block_index, operation, from_account, to_account, priority_op_serialid, deadline_block, eth_hash, eth_block, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        let mut transaction = self.0.start_transaction().await?;
+
+        MempoolSchema(&mut transaction)
+            .remove_priority_op_from_mempool(operation.priority_op_serialid)
+            .await?;
+
+        let sequence_number: Option<i64>= sqlx::query!(
+            "INSERT INTO executed_priority_operations (block_number, block_index, operation, from_account, to_account,
+                priority_op_serialid, deadline_block, eth_hash, eth_block, created_at, eth_block_index, tx_hash)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             ON CONFLICT (priority_op_serialid)
-            DO NOTHING",
+            DO NOTHING
+            RETURNING sequence_number
+            ",
             operation.block_number,
             operation.block_index,
             operation.operation,
@@ -286,9 +344,34 @@ impl<'a, 'c> OperationsSchema<'a, 'c> {
             operation.eth_hash,
             operation.eth_block,
             operation.created_at,
+            operation.eth_block_index,
+            operation.tx_hash,
         )
-        .execute(self.0.conn())
-        .await?;
+        .fetch_optional(transaction.conn())
+        .await?.map(|a| a.sequence_number).flatten();
+
+        let mut tokens = Vec::new();
+        tokens.resize(operation.affected_accounts.len(), operation.token);
+
+        if let Some(seq_no) = sequence_number {
+            sqlx::query!(
+                "
+                INSERT INTO tx_filters (address, token, tx_hash, sequence_number, is_priority)
+                SELECT u.address, u.token, $3, $4, true
+                    FROM UNNEST ($1::bytea[], $2::integer[])
+                    AS u(address, token)
+                ON CONFLICT ON CONSTRAINT tx_filters_pkey DO NOTHING
+                ",
+                &operation.affected_accounts,
+                &tokens,
+                &operation.tx_hash,
+                seq_no
+            )
+            .execute(transaction.conn())
+            .await?;
+        }
+
+        transaction.commit().await?;
         metrics::histogram!(
             "sql.chain.operations.store_executed_priority_op",
             start.elapsed()
@@ -296,7 +379,74 @@ impl<'a, 'c> OperationsSchema<'a, 'c> {
         Ok(())
     }
 
-    pub async fn eth_tx_for_withdrawal(
+    /// Returns the highest serial id of the executed priority ops
+    pub async fn get_max_priority_op_serial_id(&mut self) -> QueryResult<Option<SerialId>> {
+        let start = Instant::now();
+
+        let max_serial_id = sqlx::query!(
+            r#"SELECT max(priority_op_serialid) as "max" FROM executed_priority_operations"#
+        )
+        .fetch_one(self.0.conn())
+        .await?;
+        let max_serial_id = max_serial_id.max.map(|record| record as u64);
+
+        metrics::histogram!(
+            "sql.chain.operations.get_max_priority_op_serial_id",
+            start.elapsed()
+        );
+        Ok(max_serial_id)
+    }
+
+    /// On old contracts, a separate operation was used to withdraw - `CompleteWithdrawals`.
+    ///
+    /// NOTE: Currently `CompleteWithdrawals` is deprecated but the information is still stored
+    /// in the database and it is useful to be able to issue an ether hash for this operation.
+    async fn eth_withdraw_tx_for_complete_withdrawal(
+        &mut self,
+        withdrawal_hash: &TxHash,
+    ) -> QueryResult<Option<H256>> {
+        let start = Instant::now();
+        let pending_withdrawal = sqlx::query_as!(
+            StoredPendingWithdrawal,
+            "SELECT * FROM pending_withdrawals WHERE withdrawal_hash = $1
+            LIMIT 1",
+            withdrawal_hash.as_ref().to_vec(),
+        )
+        .fetch_optional(self.0.conn())
+        .await?;
+
+        let res = match pending_withdrawal {
+            Some(pending_withdrawal) => {
+                let pending_withdrawal_id = pending_withdrawal.id;
+
+                sqlx::query_as!(
+                    StoredCompleteWithdrawalsTransaction,
+                    "SELECT * FROM complete_withdrawals_transactions
+                        WHERE pending_withdrawals_queue_start_index <= $1
+                            AND $1 < pending_withdrawals_queue_end_index
+                    LIMIT 1
+                    ",
+                    pending_withdrawal_id,
+                )
+                .fetch_optional(self.0.conn())
+                .await?
+                .map(|complete_withdrawals_transaction| {
+                    H256::from_slice(&complete_withdrawals_transaction.tx_hash)
+                })
+            }
+            None => None,
+        };
+
+        metrics::histogram!(
+            "sql.chain.operations.eth_withdraw_tx_for_complete_withdrawal",
+            start.elapsed()
+        );
+        Ok(res)
+    }
+
+    /// On the current version of contracts all withdrawals are made as Internal Transactions in `executeBlocks`, so the hash
+    /// of the transaction in which the withdrawals from the contract to the user took place will be the same as `ExecuteBlocks` tx.
+    async fn eth_withdraw_tx_for_execute_block(
         &mut self,
         withdrawal_hash: &TxHash,
     ) -> QueryResult<Option<H256>> {
@@ -306,46 +456,113 @@ impl<'a, 'c> OperationsSchema<'a, 'c> {
             .get_tx_by_hash(withdrawal_hash.as_ref())
             .await?;
         let block_number = if let Some(tx) = tx_by_hash {
-            tx.block_number as BlockNumber
+            BlockNumber(tx.block_number as u32)
         } else {
             return Ok(None);
         };
 
-        let execute_block_operation = self
-            .get_aggregated_op_that_affects_block(AggregatedActionType::ExecuteBlocks, block_number)
+        let withdrawal_hash = EthereumSchema(self.0)
+            .aggregated_op_final_hash(block_number)
             .await?;
 
-        let res = if let Some((op_id, _)) = execute_block_operation {
-            EthereumSchema(self.0).aggregated_op_final_hash(op_id).await
-        } else {
-            Ok(None)
-        };
+        metrics::histogram!(
+            "sql.chain.operations.eth_withdraw_tx_for_execute_block",
+            start.elapsed()
+        );
+        Ok(withdrawal_hash)
+    }
+
+    /// Returns the hash of the Ethereum transaction in which the
+    /// funds were withdrawn corresponding to the withdraw operation on L2.
+    pub async fn eth_tx_for_withdrawal(
+        &mut self,
+        withdrawal_hash: &TxHash,
+    ) -> QueryResult<Option<H256>> {
+        let start = Instant::now();
+
+        // For a long time, the operation `CompleteWithdrawals` was used to withdraw funds,
+        // now it is used `ExecuteBlocks`, so we should check each of the possible options.
+        let eth_withdraw_tx_for_execute_block = self
+            .eth_withdraw_tx_for_execute_block(withdrawal_hash)
+            .await?;
+        let eth_withdraw_tx_for_complete_withdrawal = self
+            .eth_withdraw_tx_for_complete_withdrawal(withdrawal_hash)
+            .await?;
+
+        let eth_tx_hash =
+            eth_withdraw_tx_for_execute_block.or(eth_withdraw_tx_for_complete_withdrawal);
 
         metrics::histogram!(
             "sql.chain.operations.eth_tx_for_withdrawal",
             start.elapsed()
         );
-        res
+
+        Ok(eth_tx_hash)
     }
 
     pub async fn store_aggregated_action(
         &mut self,
         operation: AggregatedOperation,
     ) -> QueryResult<()> {
+        let mut transaction = self.0.start_transaction().await?;
+
         let aggregated_action_type = operation.get_action_type();
         let (from_block, to_block) = operation.get_block_range();
-        sqlx::query!(
+
+        let id = sqlx::query!(
             "INSERT INTO aggregate_operations (action_type, arguments, from_block, to_block)
             VALUES ($1, $2, $3, $4)
             ON CONFLICT (id)
-            DO NOTHING",
+            DO NOTHING
+            RETURNING id",
             aggregated_action_type.to_string(),
             serde_json::to_value(operation.clone()).expect("aggregated op serialize fail"),
-            i64::from(from_block),
-            i64::from(to_block)
+            i64::from(*from_block),
+            i64::from(*to_block)
         )
-        .execute(self.0.conn())
-        .await?;
+        .fetch_one(transaction.conn())
+        .await?
+        .id;
+
+        if operation.is_commit() {
+            sqlx::query!(
+                r#"
+                INSERT INTO commit_aggregated_blocks_binding
+                SELECT 
+                    aggregate_operations.id, blocks.number
+                FROM aggregate_operations
+                INNER JOIN blocks ON blocks.number BETWEEN aggregate_operations.from_block AND aggregate_operations.to_block
+                WHERE aggregate_operations.action_type = 'CommitBlocks' and aggregate_operations.id = $1
+                "#, 
+                id
+            ).execute(transaction.conn()).await?;
+        }
+
+        if operation.is_execute() {
+            sqlx::query!(
+                r#"
+                INSERT INTO execute_aggregated_blocks_binding
+                SELECT 
+                    aggregate_operations.id, blocks.number
+                FROM aggregate_operations
+                INNER JOIN blocks ON blocks.number BETWEEN aggregate_operations.from_block AND aggregate_operations.to_block
+                WHERE aggregate_operations.action_type = 'ExecuteBlocks' and aggregate_operations.id = $1
+                "#, 
+                id
+            ).execute(transaction.conn()).await?;
+        }
+
+        if !operation.is_create_proof() {
+            sqlx::query!(
+                "INSERT INTO eth_unprocessed_aggregated_ops (op_id)
+                VALUES ($1)",
+                id
+            )
+            .execute(transaction.conn())
+            .await?;
+        }
+
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -360,7 +577,7 @@ impl<'a, 'c> OperationsSchema<'a, 'c> {
         .fetch_one(self.0.conn())
         .await?
         .max
-        .map(|b| b as BlockNumber)
+        .map(|b| BlockNumber(b as u32))
         .unwrap_or_default();
         Ok(block_number)
     }
@@ -375,7 +592,7 @@ impl<'a, 'c> OperationsSchema<'a, 'c> {
             "SELECT * FROM aggregate_operations \
             WHERE action_type = $1 and from_block <= $2 and $2 <= to_block",
             aggregated_action.to_string(),
-            i64::from(block_number)
+            i64::from(*block_number)
         )
         .fetch_optional(self.0.conn())
         .await?
@@ -386,5 +603,146 @@ impl<'a, 'c> OperationsSchema<'a, 'c> {
             )
         });
         Ok(aggregated_op)
+    }
+
+    // Removes ethereum unprocessed aggregated operations
+    pub async fn remove_eth_unprocessed_aggregated_ops(&mut self) -> QueryResult<()> {
+        let start = Instant::now();
+        sqlx::query!("TRUNCATE eth_unprocessed_aggregated_ops")
+            .execute(self.0.conn())
+            .await?;
+
+        metrics::histogram!(
+            "sql.chain.operations.remove_eth_unprocessed_aggregated_ops",
+            start.elapsed()
+        );
+        Ok(())
+    }
+
+    // Removes executed priority operations for blocks with number greater than `last_block`
+    pub async fn return_executed_priority_operations_to_mempool(
+        &mut self,
+        last_block: BlockNumber,
+    ) -> QueryResult<()> {
+        let start = Instant::now();
+        let mut transaction = self.0.start_transaction().await?;
+
+        let records = sqlx::query_as!(
+            StoredExecutedPriorityOperation,
+            "SELECT * FROM executed_priority_operations WHERE block_number > $1",
+            *last_block as i64
+        )
+        .fetch_all(transaction.conn())
+        .await?;
+
+        let hashes: Vec<Vec<u8>> = records.iter().map(|r| r.tx_hash.clone()).collect();
+        {
+            let ops: Vec<PriorityOp> = records.into_iter().map(|rec| rec.into()).collect();
+            MempoolSchema(&mut transaction)
+                .insert_priority_ops(&ops, true)
+                .await?;
+        }
+
+        sqlx::query!("DELETE FROM tx_filters WHERE tx_hash = ANY($1)", &hashes)
+            .execute(transaction.conn())
+            .await?;
+
+        sqlx::query!(
+            "DELETE FROM executed_priority_operations WHERE block_number > $1",
+            *last_block as i64
+        )
+        .execute(transaction.conn())
+        .await?;
+
+        transaction.commit().await?;
+        metrics::histogram!(
+            "sql.chain.operations.remove_executed_priority_operations",
+            start.elapsed()
+        );
+        Ok(())
+    }
+
+    // Removes aggregate operations and bindings for blocks with number greater than `last_block`
+    pub async fn remove_aggregate_operations(
+        &mut self,
+        last_block: BlockNumber,
+    ) -> QueryResult<()> {
+        let start = Instant::now();
+        let mut transaction = self.0.start_transaction().await?;
+        sqlx::query!(
+            "DELETE FROM aggregate_operations WHERE from_block > $1 and confirmed=false",
+            *last_block as i64
+        )
+        .execute(transaction.conn())
+        .await?;
+
+        metrics::histogram!(
+            "sql.chain.operations.remove_aggregate_operations",
+            start.elapsed()
+        );
+        Ok(())
+    }
+
+    // Removes aggregate operations and bindings for blocks with number greater than `last_block`
+    pub async fn remove_aggregate_operations_and_bindings(
+        &mut self,
+        last_block: BlockNumber,
+    ) -> QueryResult<()> {
+        let start = Instant::now();
+        let mut transaction = self.0.start_transaction().await?;
+        let op_ids: Vec<i64> = sqlx::query!(
+            "SELECT id FROM aggregate_operations WHERE from_block > $1",
+            *last_block as i64
+        )
+        .fetch_all(transaction.conn())
+        .await?
+        .into_iter()
+        .map(|record| record.id)
+        .collect();
+
+        let eth_op_ids: Vec<i64> = sqlx::query!(
+            "SELECT eth_op_id FROM eth_aggregated_ops_binding WHERE op_id = ANY($1)",
+            &op_ids
+        )
+        .fetch_all(transaction.conn())
+        .await?
+        .into_iter()
+        .map(|record| record.eth_op_id)
+        .collect();
+
+        sqlx::query!(
+            "DELETE FROM eth_tx_hashes WHERE eth_op_id = ANY($1)",
+            &eth_op_ids
+        )
+        .execute(transaction.conn())
+        .await?;
+        sqlx::query!(
+            "DELETE FROM eth_aggregated_ops_binding WHERE op_id = ANY($1)",
+            &op_ids
+        )
+        .execute(transaction.conn())
+        .await?;
+        sqlx::query!("DELETE FROM eth_operations WHERE id = ANY($1)", &eth_op_ids)
+            .execute(transaction.conn())
+            .await?;
+        sqlx::query!(
+            "DELETE FROM aggregate_operations WHERE from_block > $1",
+            *last_block as i64
+        )
+        .execute(transaction.conn())
+        .await?;
+        sqlx::query!(
+            "UPDATE aggregate_operations SET to_block = $1 WHERE to_block > $1",
+            *last_block as i64
+        )
+        .execute(transaction.conn())
+        .await?;
+        transaction.commit().await?;
+
+        metrics::histogram!(
+            "sql.chain.operations.remove_aggregate_operations_and_bindings",
+            start.elapsed()
+        );
+        Ok(())
     }
 }

@@ -1,13 +1,18 @@
-use crate::bellman::plonk::better_better_cs::proof::Proof as NewProof;
-use crate::bellman::plonk::better_cs::{
-    cs::PlonkCsWidth4WithNextStepParams,
-    keys::{Proof as OldProof, VerificationKey as SingleVk},
+use crate::{
+    bellman::plonk::{
+        better_better_cs::proof::Proof as NewProof,
+        better_cs::{
+            cs::PlonkCsWidth4WithNextStepParams,
+            keys::{Proof as OldProof, VerificationKey as SingleVk},
+        },
+    },
+    primitives::EthereumSerializer,
+    serialization::{
+        serialize_new_proof, serialize_single_proof, AggregatedProofSerde, SingleProofSerde,
+        VecFrSerde,
+    },
+    Engine, Fr,
 };
-use crate::serialization::{
-    serialize_fe_for_ethereum, serialize_new_proof, AggregatedProofSerde, SingleProofSerde,
-    VecFrSerde,
-};
-use crate::{Engine, Fr};
 use ethabi::Token;
 use recursive_aggregation_circuit::circuit::RecursiveAggregationCircuitBn256;
 use serde::{Deserialize, Serialize};
@@ -28,6 +33,12 @@ impl From<OldProofType> for SingleProof {
 impl Default for SingleProof {
     fn default() -> Self {
         SingleProof(OldProofType::empty())
+    }
+}
+
+impl SingleProof {
+    pub fn serialize_single_proof(&self) -> EncodedSingleProof {
+        serialize_single_proof(&self.0)
     }
 }
 
@@ -84,12 +95,12 @@ impl AggregatedProof {
         let subproof_limbs = self
             .aggr_limbs
             .iter()
-            .map(serialize_fe_for_ethereum)
+            .map(EthereumSerializer::serialize_fe)
             .collect();
         let individual_vk_inputs = self
             .individual_vk_inputs
             .iter()
-            .map(serialize_fe_for_ethereum)
+            .map(EthereumSerializer::serialize_fe)
             .collect();
         let individual_vk_idxs = self
             .individual_vk_idxs
@@ -163,6 +174,28 @@ impl Default for EncodedAggregatedProof {
             subproof_limbs: vec![U256::default(); 16],
             individual_vk_inputs: vec![U256::default(); 1],
             individual_vk_idxs: vec![U256::default(); 1],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrecomputedSampleProofs {
+    pub single_proofs: Vec<(SingleProof, usize)>,
+    pub aggregated_proof: AggregatedProof,
+}
+
+/// Encoded representation of the block proof.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct EncodedSingleProof {
+    pub inputs: Vec<U256>,
+    pub proof: Vec<U256>,
+}
+
+impl Default for EncodedSingleProof {
+    fn default() -> Self {
+        Self {
+            inputs: vec![U256::default(); 1],
+            proof: vec![U256::default(); 33],
         }
     }
 }

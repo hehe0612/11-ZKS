@@ -4,6 +4,10 @@ use num::BigUint;
 use std::time::Instant;
 use web3::transports::Http;
 
+use zksync_test_account::ZkSyncETHAccountData;
+use zksync_types::block::Block;
+use zksync_types::{Nonce, TokenId};
+
 use crate::{
     data_restore::verify_restore,
     eth_account::{parse_ether, EthereumAccount},
@@ -13,7 +17,6 @@ use crate::{
 };
 
 use super::*;
-use zksync_types::block::Block;
 
 /// Performs a fixed set of operations which covers most of the main server's functionality.
 /// Aim is to cover operations processed by state keeper, while manually simulating everything else around it.
@@ -26,9 +29,9 @@ pub async fn perform_basic_tests() {
     let fee_account = ZkSyncAccount::rand();
     let fee_account_address = fee_account.address;
     let (sk_thread_handle, stop_state_keeper_sender, sk_channels) =
-        spawn_state_keeper(&fee_account_address);
+        spawn_state_keeper(&fee_account_address, genesis_state(&fee_account_address));
 
-    let initial_root = genesis_state(&fee_account.address).tree.root_hash();
+    let initial_root = genesis_state(&fee_account.address).state.root_hash();
 
     let deploy_timer = Instant::now();
     println!("deploying contracts");
@@ -65,15 +68,16 @@ pub async fn perform_basic_tests() {
         .collect::<Vec<_>>();
 
     let zksync_accounts = {
-        let mut zksync_accounts = Vec::new();
-        zksync_accounts.push(fee_account);
+        let mut zksync_accounts = vec![fee_account];
         zksync_accounts.extend(eth_accounts.iter().map(|eth_account| {
             let rng_zksync_key = ZkSyncAccount::rand().private_key;
             ZkSyncAccount::new(
                 rng_zksync_key,
-                0,
+                Nonce(0),
                 eth_account.address,
-                eth_account.private_key,
+                ZkSyncETHAccountData::EOA {
+                    eth_private_key: eth_account.private_key,
+                },
             )
         }));
         zksync_accounts
@@ -91,28 +95,44 @@ pub async fn perform_basic_tests() {
         &contracts,
         commit_account,
         initial_root,
+        None,
     );
 
     let deposit_amount = parse_ether("1.0").unwrap();
 
-    let mut tokens = vec![];
-    for token in 0..=1 {
-        perform_basic_operations(
-            token,
-            &mut test_setup,
-            deposit_amount.clone(),
-            BlockProcessing::CommitAndVerify,
-        )
-        .await;
-        tokens.push(token);
-    }
+    let token = TokenId(1);
+    let executed_blocks = perform_basic_operations(
+        token,
+        &mut test_setup,
+        deposit_amount.clone(),
+        BlockProcessing::CommitAndVerify,
+    )
+    .await;
+    let tokens = vec![token];
 
+    // Verify queued transactions events.
+    let expected_operations_num: usize = executed_blocks
+        .iter()
+        .map(|block| block.block_transactions.len())
+        .sum();
+    let mut operations_num: usize = 0;
+    while let Ok(Some(message)) = test_setup.processed_tx_events_receiver.try_next() {
+        operations_num += message.executed_ops.len();
+    }
+    assert!(operations_num > 0);
+    assert_eq!(operations_num, expected_operations_num);
+
+    let acc_state_from_test_setup = test_setup
+        .get_accounts_state()
+        .await
+        .into_iter()
+        .map(|(id, acc)| (id.0, acc))
+        .collect();
     verify_restore(
-        &testkit_config.web3_url,
-        testkit_config.available_block_chunk_sizes.clone(),
+        &testkit_config,
         &contracts,
         fee_account_address,
-        test_setup.get_accounts_state().await,
+        acc_state_from_test_setup,
         tokens,
         test_setup.last_committed_block.new_root_hash,
     )
@@ -129,18 +149,20 @@ pub enum BlockProcessing {
 }
 
 pub async fn perform_basic_operations(
-    token: u16,
+    token: TokenId,
     test_setup: &mut TestSetup,
     deposit_amount: BigUint,
     blocks_processing: BlockProcessing,
 ) -> Vec<Block> {
     let mut executed_blocks = Vec::new();
-    // test deposit to other account
+
+    // // test deposit to other account
     test_setup.start_block();
+
     test_setup
         .deposit(
             ETHAccountId(0),
-            ZKSyncAccountId(2),
+            ZKSyncAccountId(1),
             Token(token),
             deposit_amount.clone(),
         )
@@ -155,7 +177,10 @@ pub async fn perform_basic_operations(
         test_setup.execute_commit_block().await
     };
     executed_blocks.push(block);
-    println!("Deposit to other account test success, token_id: {}", token);
+    println!(
+        "Deposit to other account test success, token_id: {}",
+        *token
+    );
 
     // test two deposits
     test_setup.start_block();
@@ -167,14 +192,16 @@ pub async fn perform_basic_operations(
             deposit_amount.clone(),
         )
         .await;
+
     test_setup
         .deposit(
             ETHAccountId(0),
-            ZKSyncAccountId(1),
+            ZKSyncAccountId(2),
             Token(token),
             deposit_amount.clone(),
         )
         .await;
+
     let block = if blocks_processing == BlockProcessing::CommitAndVerify {
         test_setup
             .execute_commit_and_verify_block()
@@ -185,8 +212,8 @@ pub async fn perform_basic_operations(
         test_setup.execute_commit_block().await
     };
     executed_blocks.push(block);
-    println!("Deposit test success, token_id: {}", token);
-
+    println!("Deposit test success, token_id: {}", *token);
+    //
     // test transfers
     test_setup.start_block();
 
@@ -213,10 +240,11 @@ pub async fn perform_basic_operations(
             Token(token),
             &deposit_amount / BigUint::from(8u32),
             &deposit_amount / BigUint::from(8u32),
+            Default::default(),
         )
         .await;
-
-    //should be executed as a transfer
+    //
+    // //should be executed as a transfer
     test_setup
         .transfer(
             ZKSyncAccountId(1),
@@ -224,6 +252,7 @@ pub async fn perform_basic_operations(
             Token(token),
             &deposit_amount / BigUint::from(8u32),
             &deposit_amount / BigUint::from(8u32),
+            Default::default(),
         )
         .await;
 
@@ -235,6 +264,7 @@ pub async fn perform_basic_operations(
         deposit_amount.clone(),
         BigUint::from(0u32),
         Some(nonce + 1),
+        Default::default(),
         false,
     );
     test_setup
@@ -249,6 +279,7 @@ pub async fn perform_basic_operations(
             Token(token),
             &deposit_amount / BigUint::from(4u32),
             &deposit_amount / BigUint::from(4u32),
+            Default::default(),
         )
         .await;
 
@@ -275,12 +306,16 @@ pub async fn perform_basic_operations(
         test_setup.execute_commit_block().await
     };
     executed_blocks.push(block);
-    println!("Transfer test success, token_id: {}", token);
+    println!("Transfer test success, token_id: {}", *token);
 
     test_setup.start_block();
     test_setup
         .full_exit(ETHAccountId(0), ZKSyncAccountId(1), Token(token))
         .await;
+    test_setup
+        .full_exit(ETHAccountId(0), ZKSyncAccountId(1), Token(token))
+        .await;
+
     let block = if blocks_processing == BlockProcessing::CommitAndVerify {
         test_setup
             .execute_commit_and_verify_block()

@@ -1,18 +1,20 @@
 // Built-in deps
-use std::convert::TryInto;
-use std::mem;
+use std::{convert::TryInto, mem};
 // External deps
-use crate::franklin_crypto::bellman::pairing::bn256::Bn256;
-use crate::franklin_crypto::bellman::pairing::ff::ScalarEngine;
-use crate::franklin_crypto::bellman::pairing::ff::{PrimeField, PrimeFieldRepr};
-use crate::franklin_crypto::bellman::pairing::{CurveAffine, Engine};
-use anyhow::bail;
+use crate::franklin_crypto::bellman::pairing::{
+    bn256::Bn256,
+    ff::{PrimeField, PrimeFieldRepr, ScalarEngine},
+    CurveAffine, Engine,
+};
 use num::{BigUint, ToPrimitive};
 use zksync_basic_types::U256;
 // Workspace deps
-use crate::circuit::utils::append_le_fixed_width;
-use crate::merkle_tree::{hasher::Hasher, rescue_hasher::BabyRescueHasher};
-use crate::params;
+use crate::{
+    circuit::utils::append_le_fixed_width,
+    error::PackingError,
+    merkle_tree::{hasher::Hasher, rescue_hasher::BabyRescueHasher},
+    params,
+};
 
 pub trait GetBits {
     fn get_bits_le(&self) -> Vec<bool>;
@@ -185,12 +187,23 @@ impl BitConvert {
 pub struct FloatConversions;
 
 impl FloatConversions {
-    /// Packs a BigUint less than 2 ^ 128  to a floating-point number with an exponent base = 10.
+    /// Packs a BigUint less than 2 ^ 128 to a floating-point number with an exponent base = 10 that is less or equal to initial number.
     /// Can lose accuracy with small parameters `exponent_len` and `mantissa_len`.
     pub fn pack(number: &BigUint, exponent_len: usize, mantissa_len: usize) -> Vec<u8> {
         let uint = number.to_u128().expect("Only u128 allowed");
 
         let mut vec = Self::to_float(uint, exponent_len, mantissa_len, 10).expect("packing error");
+        vec.reverse();
+        BitConvert::into_bytes_ordered(vec)
+    }
+
+    /// Packs a BigUint less than 2 ^ 128 to a floating-point number with an exponent base = 10 that is greater or equal to initial number.
+    /// Can lose accuracy with small parameters `exponent_len` and `mantissa_len`.
+    pub fn pack_up(number: &BigUint, exponent_len: usize, mantissa_len: usize) -> Vec<u8> {
+        let uint = number.to_u128().expect("Only u128 allowed");
+
+        let mut vec =
+            Self::to_float_up(uint, exponent_len, mantissa_len, 10).expect("packing error");
         vec.reverse();
         BitConvert::into_bytes_ordered(vec)
     }
@@ -227,58 +240,114 @@ impl FloatConversions {
         mantissa.checked_mul(exponent)
     }
 
-    /// Packs a u128 to a floating-point number with the given parameters.
-    /// Can lose accuracy with small parameters `exponent_len` and `mantissa_len`.
+    /// Packs a u128 to a floating-point number with the given parameters that is less or equal to integer.
+    /// Can lose accuracy with small parameters `exponent_length` and `mantissa_length`.
     #[allow(clippy::wrong_self_convention)]
     pub fn to_float(
         integer: u128,
         exponent_length: usize,
         mantissa_length: usize,
         exponent_base: u32,
-    ) -> Result<Vec<bool>, anyhow::Error> {
+    ) -> Result<Vec<bool>, PackingError> {
         let exponent_base = u128::from(exponent_base);
 
-        let mut max_exponent = 1u128;
         let max_power = (1 << exponent_length) - 1;
 
-        for _ in 0..max_power {
-            max_exponent = max_exponent.saturating_mul(exponent_base);
-        }
+        let max_exponent = (exponent_base as u128).saturating_pow(max_power);
 
         let max_mantissa = (1u128 << mantissa_length) - 1;
 
-        if integer > (max_mantissa.saturating_mul(max_exponent)) {
-            bail!("Integer is too big");
+        let limit = max_mantissa.saturating_mul(max_exponent);
+        if integer > limit {
+            return Err(PackingError::IntegerTooBig { integer, limit });
         }
 
+        // The algortihm is as follows: calculate minimal exponent
+        // such that integer <= max_mantissa * exponent_base ^ exponent,
+        // then if this minimal exponent is 0 we can choose mantissa equals integer and exponent equals 0
+        // else we need to check two variants:
+        // 1) with that minimal exponent
+        // 2) with that minimal exponent minus 1
         let mut exponent: usize = 0;
-        let mantissa = if integer > max_mantissa {
-            // always try best precision
-            let exponent_guess = integer / max_mantissa;
-            let mut exponent_temp = exponent_guess;
-
-            loop {
-                if exponent_temp < exponent_base {
-                    break;
-                }
-                exponent_temp /= exponent_base;
-                exponent += 1;
-            }
-
-            exponent_temp = 1u128;
-            for _ in 0..exponent {
-                exponent_temp *= exponent_base;
-            }
-
-            if exponent_temp * max_mantissa < integer {
-                exponent += 1;
-                exponent_temp *= exponent_base;
-            }
-
-            integer / exponent_temp
+        let mut exponent_temp: u128 = 1;
+        while integer > max_mantissa * exponent_temp {
+            exponent_temp *= exponent_base;
+            exponent += 1;
+        }
+        let (exponent, mantissa) = if exponent == 0 {
+            (0, integer)
         } else {
-            integer
+            let mantissa = integer / exponent_temp;
+            let variant1 = mantissa * exponent_temp;
+            let variant2 = max_mantissa * exponent_temp / exponent_base;
+            let diff1 = integer - variant1;
+            let diff2 = integer - variant2;
+            if diff1 < diff2 {
+                (exponent, mantissa)
+            } else {
+                (exponent - 1, max_mantissa)
+            }
         };
+
+        // encode into bits. First bits of mantissa in LE order
+
+        let mut encoding = Vec::with_capacity(exponent_length + mantissa_length);
+
+        for i in 0..exponent_length {
+            if exponent & (1 << i) != 0 {
+                encoding.push(true);
+            } else {
+                encoding.push(false);
+            }
+        }
+
+        for i in 0..mantissa_length {
+            if mantissa & (1 << i) != 0 {
+                encoding.push(true);
+            } else {
+                encoding.push(false);
+            }
+        }
+
+        debug_assert_eq!(encoding.len(), exponent_length + mantissa_length);
+        Ok(encoding)
+    }
+
+    /// Packs a u128 to a floating-point number with the given parameters that is greater or equal to integer.
+    /// Can lose accuracy with small parameters `exponent_len` and `mantissa_len`.
+    #[allow(clippy::wrong_self_convention)]
+    pub fn to_float_up(
+        integer: u128,
+        exponent_length: usize,
+        mantissa_length: usize,
+        exponent_base: u32,
+    ) -> Result<Vec<bool>, PackingError> {
+        let exponent_base = u128::from(exponent_base);
+
+        let max_power = (1 << exponent_length) - 1;
+
+        let max_exponent = (exponent_base as u128).saturating_pow(max_power);
+
+        let max_mantissa = (1u128 << mantissa_length) - 1;
+
+        let limit = max_mantissa.saturating_mul(max_exponent);
+        if integer > limit {
+            return Err(PackingError::IntegerTooBig { integer, limit });
+        }
+
+        // The algortihm is as follows: calculate minimal exponent
+        // such that integer <= max_mantissa * exponent_base ^ exponent,
+        // then mantissa is calculated as integer divided by exponent_base ^ exponent and rounded up
+        let mut exponent: usize = 0;
+        let mut exponent_temp: u128 = 1;
+        while integer > max_mantissa * exponent_temp {
+            exponent_temp *= exponent_base;
+            exponent += 1;
+        }
+        let mut mantissa = integer / exponent_temp;
+        if integer % exponent_temp != 0 {
+            mantissa += 1;
+        }
 
         // encode into bits. First bits of mantissa in LE order
 
@@ -307,12 +376,29 @@ impl FloatConversions {
 
 pub fn rescue_hash_tx_msg(msg: &[u8]) -> Vec<u8> {
     let mut msg_bits = BitConvert::from_be_bytes(msg);
+    assert!(msg_bits.len() <= params::PAD_MSG_BEFORE_HASH_BITS_LEN);
     msg_bits.resize(params::PAD_MSG_BEFORE_HASH_BITS_LEN, false);
     let hasher = &params::RESCUE_HASHER as &BabyRescueHasher;
     let hash_fr = hasher.hash_bits(msg_bits.into_iter());
     let mut hash_bits = Vec::new();
     append_le_fixed_width(&mut hash_bits, &hash_fr, 256);
     BitConvert::into_bytes(hash_bits)
+}
+
+// This differs from `rescue_hash_tx_msg` in several ways:
+// - It does not constrain its input to be <= 92 bytes
+//   In fact, it only accepts inputs of 176 bytes (2 * order_size)
+// - It does not pad its message
+// - It encodes the resulting Fr a bit differently
+// - It returns 31 byte instead of 32
+pub fn rescue_hash_orders(msg: &[u8]) -> Vec<u8> {
+    assert_eq!(msg.len(), 178);
+    let msg_bits = BitConvert::from_be_bytes(msg);
+    let hasher = &params::RESCUE_HASHER as &BabyRescueHasher;
+    let hash_fr = hasher.hash_bits(msg_bits.into_iter());
+    // 248 == bits in max whole number of bytes that fit into Fr
+    let hash_bits = hash_fr.get_bits_le_fixed(248);
+    BitConvert::into_bytes_ordered(hash_bits)
 }
 
 pub trait FromBytes: Sized {
@@ -395,6 +481,46 @@ mod test {
                 false, true, false, true, false, true, true, true, true, false, true, true, false,
                 false, false
             ])
+        );
+
+        // Check if 2048 is converted to 2047*10^0 with given parameters
+        let convert_number = FloatConversions::to_float(2048, 5, 11, 10);
+        assert_eq!(
+            convert_number.ok(),
+            Some(vec![
+                false, false, false, false, false, true, true, true, true, true, true, true, true,
+                true, true, true
+            ])
+        );
+
+        // Check if 2051 is converted to 205*10^1 with given parameters
+        let convert_number = FloatConversions::to_float(2051, 5, 11, 10);
+        assert_eq!(
+            convert_number.ok(),
+            Some(vec![
+                true, false, false, false, false, true, false, true, true, false, false, true,
+                true, false, false, false
+            ])
+        );
+
+        // Check if 2051 is converted up to 206*10^1 with given parameters
+        let convert_number = FloatConversions::to_float_up(2051, 5, 11, 10);
+        assert_eq!(
+            convert_number.ok(),
+            Some(vec![
+                true, false, false, false, false, false, true, true, true, false, false, true,
+                true, false, false, false
+            ])
+        );
+
+        // Test behaviour when too large integer is passed
+        let convert_number = FloatConversions::to_float_up(20000, 2, 4, 10);
+        assert_eq!(
+            convert_number.err(),
+            Some(PackingError::IntegerTooBig {
+                integer: 20000,
+                limit: 15000
+            })
         );
     }
 

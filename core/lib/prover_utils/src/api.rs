@@ -1,13 +1,11 @@
 use serde::{Deserialize, Serialize};
-use zksync_basic_types::BlockNumber;
 use zksync_circuit::serialization::ProverData;
 use zksync_crypto::proof::{AggregatedProof, SingleProof};
-
-pub type ProverId = String;
+use zksync_types::BlockNumber;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ProverInputRequest {
-    pub prover_name: ProverId,
+    pub prover_name: String,
     pub aux_data: ProverInputRequestAuxData,
 }
 
@@ -26,10 +24,10 @@ pub struct ProverInputResponse {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum JobRequestData {
     BlockProof(
         ProverData,
-        // zksync_circuit::circuit::ZkSyncCircuit<'static, Engine>,
         usize, // block size
     ),
     AggregatedBlockProof(Vec<(SingleProof, usize)>),
@@ -44,6 +42,7 @@ pub struct ProverOutputRequest {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum JobResultData {
     BlockProof(SingleProof),
     AggregatedBlockProof(AggregatedProof),
@@ -57,5 +56,5 @@ pub struct WorkingOn {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ProverStopped {
-    pub prover_id: ProverId,
+    pub prover_name: String,
 }

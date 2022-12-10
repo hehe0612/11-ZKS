@@ -1,23 +1,22 @@
 //! Declaration of the API structure.
 
-use crate::{
-    api_server::rest::{
-        helpers::*,
-        v01::{caches::Caches, network_status::SharedNetworkStatus},
-    },
-    core_api_client::{CoreApiClient, EthBlockId},
-};
+use crate::api_server::rest::{helpers::*, v01::caches::Caches};
+use actix_web::error::InternalError;
 use actix_web::{web, HttpResponse, Result as ActixResult};
 use futures::channel::mpsc;
-use zksync_config::{ApiServerOptions, ConfigurationOptions};
+
+use crate::api_server::rest::network_status::SharedNetworkStatus;
+use zksync_config::ZkSyncConfig;
 use zksync_storage::{
     chain::{
-        block::records::BlockDetails,
+        block::records::StorageBlockDetails,
         operations_ext::records::{PriorityOpReceiptResponse, TxReceiptResponse},
     },
     ConnectionPool, StorageProcessor,
 };
-use zksync_types::{block::ExecutedOperations, PriorityOp, H160, H256};
+use zksync_types::{
+    block::ExecutedOperations, BlockNumber, PriorityOp, SequentialTxId, H160, H256,
+};
 
 /// `ApiV01` structure contains the implementation of `/api/v0.1` endpoints set.
 /// It is considered (somewhat) stable and will be supported for a while.
@@ -28,39 +27,41 @@ use zksync_types::{block::ExecutedOperations, PriorityOp, H160, H256};
 pub struct ApiV01 {
     pub(crate) caches: Caches,
     pub(crate) connection_pool: ConnectionPool,
-    pub(crate) api_client: CoreApiClient,
+    pub(crate) main_database_connection_pool: ConnectionPool,
     pub(crate) network_status: SharedNetworkStatus,
     pub(crate) contract_address: String,
-    pub(crate) config_options: ConfigurationOptions,
-    pub(crate) api_server_options: ApiServerOptions,
+    pub(crate) config: ZkSyncConfig,
 }
 
 impl ApiV01 {
     pub fn new(
         connection_pool: ConnectionPool,
+        main_database_connection_pool: ConnectionPool,
         contract_address: H160,
-        config_options: ConfigurationOptions,
-        api_server_options: ApiServerOptions,
+        config: ZkSyncConfig,
+        network_status: SharedNetworkStatus,
     ) -> Self {
-        let api_client = CoreApiClient::new(api_server_options.core_server_url.clone());
         Self {
-            caches: Caches::new(api_server_options.api_requests_caches_size),
+            caches: Caches::new(config.api.common.caches_size),
             connection_pool,
-            api_client,
-            network_status: SharedNetworkStatus::default(),
+            main_database_connection_pool,
+            network_status,
             contract_address: format!("{:?}", contract_address),
-            config_options,
-            api_server_options,
+            config,
         }
     }
 
     /// Creates an actix-web `Scope`, which can be mounted to the Http server.
     pub fn into_scope(self) -> actix_web::Scope {
         web::scope("/api/v0.1")
-            .data(self)
+            .app_data(web::Data::new(self))
             .route("/testnet_config", web::get().to(Self::testnet_config))
             .route("/status", web::get().to(Self::status))
             .route("/tokens", web::get().to(Self::tokens))
+            .route(
+                "/tokens_acceptable_for_fees",
+                web::get().to(Self::tokens_acceptable_for_fees),
+            )
             .route(
                 "/account/{address}/history/{offset}/{limit}",
                 web::get().to(Self::tx_history),
@@ -105,20 +106,26 @@ impl ApiV01 {
     pub(crate) async fn access_storage(&self) -> ActixResult<StorageProcessor<'_>> {
         self.connection_pool.access_storage().await.map_err(|err| {
             vlog::warn!("DB await timeout: '{}';", err);
-            HttpResponse::RequestTimeout().finish().into()
+            actix_web::error::ErrorRequestTimeout(err)
         })
     }
 
-    pub(crate) fn db_error(error: anyhow::Error) -> HttpResponse {
+    pub(crate) fn db_error(error: anyhow::Error) -> InternalError<anyhow::Error> {
         vlog::warn!("DB error: '{}';", error);
-        HttpResponse::InternalServerError().finish()
+        InternalError::from_response(error, HttpResponse::InternalServerError().finish())
     }
 
     // Spawns future updating SharedNetworkStatus in the current `actix::System`
-    pub fn spawn_network_status_updater(&self, panic_notify: mpsc::Sender<bool>) {
-        self.network_status
-            .clone()
-            .start_updater_detached(panic_notify, self.connection_pool.clone());
+    pub fn spawn_network_status_updater(
+        &self,
+        panic_notify: mpsc::Sender<bool>,
+        last_tx_id: SequentialTxId,
+    ) {
+        self.network_status.clone().start_updater_detached(
+            panic_notify,
+            self.connection_pool.clone(),
+            last_tx_id,
+        );
     }
 
     // cache access functions
@@ -166,7 +173,7 @@ impl ApiV01 {
             .await
             .map_err(|err| {
                 vlog::warn!("Internal Server Error: '{}'; input: {}", err, id);
-                HttpResponse::InternalServerError().finish()
+                InternalError::from_response(err, HttpResponse::InternalServerError().finish())
             })?;
 
         // Unverified blocks can still change, so we can't cache them.
@@ -179,7 +186,7 @@ impl ApiV01 {
 
     pub async fn get_block_executed_ops(
         &self,
-        block_id: u32,
+        block_id: BlockNumber,
     ) -> Result<Vec<ExecutedOperations>, actix_web::error::Error> {
         if let Some(executed_ops) = self.caches.block_executed_ops.get(&block_id) {
             return Ok(executed_ops);
@@ -193,21 +200,21 @@ impl ApiV01 {
             .get_block_executed_ops(block_id)
             .await
             .map_err(|err| {
-                vlog::warn!("Internal Server Error: '{}'; input: {}", err, block_id);
-                HttpResponse::InternalServerError().finish()
+                vlog::warn!("Internal Server Error: '{}'; input: {}", err, *block_id);
+                InternalError::from_response(err, HttpResponse::InternalServerError().finish())
             })?;
 
         if let Ok(block_details) = transaction
             .chain()
             .block_schema()
-            .load_block_range(block_id, 1)
+            .load_block_range_desc(block_id, 1)
             .await
         {
             // Unverified blocks can still change, so we can't cache them.
             if !block_details.is_empty() && block_verified(&block_details[0]) {
                 self.caches
                     .block_executed_ops
-                    .insert(block_id, executed_ops.clone());
+                    .insert(*block_id, executed_ops.clone());
             }
         }
         transaction.commit().await.unwrap_or_default();
@@ -217,8 +224,8 @@ impl ApiV01 {
 
     pub async fn get_block_info(
         &self,
-        block_id: u32,
-    ) -> Result<Option<BlockDetails>, actix_web::error::Error> {
+        block_id: BlockNumber,
+    ) -> Result<Option<StorageBlockDetails>, actix_web::error::Error> {
         if let Some(block) = self.caches.blocks_info.get(&block_id) {
             return Ok(Some(block));
         }
@@ -227,20 +234,18 @@ impl ApiV01 {
         let mut blocks = storage
             .chain()
             .block_schema()
-            .load_block_range(block_id, 1)
+            .load_block_range_desc(block_id, 1)
             .await
             .map_err(|err| {
-                vlog::warn!("Internal Server Error: '{}'; input: {}", err, block_id);
-                HttpResponse::InternalServerError().finish()
+                vlog::warn!("Internal Server Error: '{}'; input: {}", err, *block_id);
+                InternalError::from_response(err, HttpResponse::InternalServerError().finish())
             })?;
 
         if !blocks.is_empty()
             && block_verified(&blocks[0])
-            && blocks[0].block_number == block_id as i64
+            && blocks[0].block_number == *block_id as i64
         {
-            self.caches
-                .blocks_info
-                .insert(block_id as u32, blocks[0].clone());
+            self.caches.blocks_info.insert(*block_id, blocks[0].clone());
         }
 
         Ok(blocks.pop())
@@ -249,7 +254,7 @@ impl ApiV01 {
     pub async fn get_block_by_height_or_hash(
         &self,
         query: String,
-    ) -> Result<Option<BlockDetails>, actix_web::error::Error> {
+    ) -> Result<Option<StorageBlockDetails>, actix_web::error::Error> {
         if let Some(block) = self.caches.blocks_by_height_or_hash.get(&query) {
             return Ok(Some(block));
         }
@@ -275,7 +280,12 @@ impl ApiV01 {
     pub(crate) async fn get_unconfirmed_op_by_hash(
         &self,
         eth_tx_hash: H256,
-    ) -> Result<Option<(EthBlockId, PriorityOp)>, anyhow::Error> {
-        self.api_client.get_unconfirmed_op(eth_tx_hash).await
+    ) -> Result<Option<PriorityOp>, anyhow::Error> {
+        let mut storage = self.connection_pool.access_storage().await?;
+        Ok(storage
+            .chain()
+            .mempool_schema()
+            .get_pending_operation_by_hash(eth_tx_hash)
+            .await?)
     }
 }

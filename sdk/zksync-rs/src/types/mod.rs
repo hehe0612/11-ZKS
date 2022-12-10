@@ -1,15 +1,27 @@
+use std::collections::HashMap;
+
 use num::BigUint;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use zksync_types::{AccountId, Address, Nonce, PubKeyHash, Token};
+
+use zksync_types::{AccountId, Address, Nonce, PubKeyHash, Token, TokenId, H256};
 use zksync_utils::{BigUintSerdeAsRadix10Str, BigUintSerdeWrapper};
 
 pub type Tokens = HashMap<String, Token>;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NFT {
+    pub id: TokenId,
+    pub symbol: String,
+    pub creator_id: AccountId,
+    pub content_hash: H256,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AccountState {
     pub balances: HashMap<String, BigUintSerdeWrapper>,
+    pub nfts: HashMap<TokenId, NFT>,
     pub nonce: Nonce,
     pub pub_key_hash: PubKeyHash,
 }
@@ -90,41 +102,11 @@ pub struct ContractAddress {
     pub gov_contract: String,
 }
 
-/// Flattened `PriorityOp` object representing a deposit operation.
-/// Used in the `OngoingDepositsResp`.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OngoingDeposit {
-    pub received_on_block: u64,
-    pub token_id: u16,
-    pub amount: u128,
-    pub eth_tx_hash: String,
-}
-
-/// Information about ongoing deposits for certain recipient address.
-///
-/// Please note that since this response is based on the events that are
-/// currently awaiting confirmations, this information is approximate:
-/// blocks on Ethereum can be reverted, and final list of executed deposits
-/// can differ from the this estimation.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OngoingDeposits {
-    /// Address for which response is served.
-    pub address: Address,
-    /// List of tuples (Eth block number, Deposit operation) of ongoing
-    /// deposit operations.
-    pub deposits: Vec<OngoingDeposit>,
-
-    /// Amount of confirmations required for every deposit to be processed.
-    pub confirmations_for_eth_event: u64,
-
-    /// Estimated block number for deposits completions:
-    /// all the deposit operations for provided address are expected to be
-    /// accepted in the zkSync network upon reaching this blocks.
-    ///
-    /// Can be `None` if there are no ongoing deposits.
-    pub estimated_deposits_approval_block: Option<u64>,
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ChangePubKeyFeeType {
+    Onchain,
+    ECDSA,
+    CREATE2,
 }
 
 /// Type of the fee calculation pattern.
@@ -139,10 +121,10 @@ pub enum OutputFeeType {
     TransferToNew,
     FastWithdraw,
     Withdraw,
-    ChangePubKey {
-        #[serde(rename = "onchainPubkeyAuth")]
-        onchain_pubkey_auth: bool,
-    },
+    ChangePubKey(ChangePubKeyFeeType),
+    MintNFT,
+    WithdrawNFT,
+    FastWithdrawNFT,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -157,6 +139,13 @@ pub struct Fee {
     pub gas_fee: BigUint,
     #[serde(with = "BigUintSerdeAsRadix10Str")]
     pub zkp_fee: BigUint,
+    #[serde(with = "BigUintSerdeAsRadix10Str")]
+    pub total_fee: BigUint,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct BatchFee {
     #[serde(with = "BigUintSerdeAsRadix10Str")]
     pub total_fee: BigUint,
 }

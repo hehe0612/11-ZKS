@@ -1,13 +1,16 @@
+use std::time::Instant;
 // Built-in
 use std::{thread, time};
 // External
 use futures::channel::mpsc;
+use tokio::time::sleep;
+use zksync_crypto::merkle_tree::parallel_smt::SparseMerkleTreeSerializableCacheBN256;
 // Workspace deps
+use crate::database_interface::DatabaseInterface;
 use zksync_circuit::serialization::ProverData;
 use zksync_circuit::witness::utils::build_block_witness;
 use zksync_crypto::circuit::CircuitAccountTree;
 use zksync_crypto::params::account_tree_depth;
-use zksync_storage::StorageProcessor;
 use zksync_types::block::Block;
 use zksync_types::BlockNumber;
 use zksync_utils::panic_notify::ThreadPanicNotify;
@@ -17,9 +20,9 @@ use zksync_utils::panic_notify::ThreadPanicNotify;
 ///
 /// This will generate and store in db witnesses for blocks with indexes
 /// start_block, start_block + block_step, start_block + 2*block_step, ...
-pub struct WitnessGenerator {
+pub struct WitnessGenerator<DB: DatabaseInterface> {
     /// Connection to the database.
-    conn_pool: zksync_storage::ConnectionPool,
+    database: DB,
     /// Routine refresh interval.
     rounds_interval: time::Duration,
 
@@ -27,22 +30,23 @@ pub struct WitnessGenerator {
     block_step: BlockNumber,
 }
 
+#[derive(Debug)]
 enum BlockInfo {
     NotReadyBlock,
     WithWitness,
     NoWitness(Block),
 }
 
-impl WitnessGenerator {
+impl<DB: DatabaseInterface> WitnessGenerator<DB> {
     /// Creates a new `WitnessGenerator` object.
     pub fn new(
-        conn_pool: zksync_storage::ConnectionPool,
+        database: DB,
         rounds_interval: time::Duration,
         start_block: BlockNumber,
         block_step: BlockNumber,
     ) -> Self {
         Self {
-            conn_pool,
+            database,
             rounds_interval,
             start_block,
             block_step,
@@ -55,8 +59,7 @@ impl WitnessGenerator {
             .name("prover_server_pool".to_string())
             .spawn(move || {
                 let _panic_sentinel = ThreadPanicNotify(panic_notify);
-                let mut runtime = tokio::runtime::Builder::new()
-                    .basic_scheduler()
+                let runtime = tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .build()
                     .expect("Unable to build runtime for a witness generator");
@@ -73,17 +76,17 @@ impl WitnessGenerator {
         &self,
         block_number: BlockNumber,
     ) -> Result<BlockInfo, anyhow::Error> {
-        let mut storage = self.conn_pool.access_storage().await?;
+        let start = Instant::now();
+        let mut storage = self.database.acquire_connection().await?;
         let mut transaction = storage.start_transaction().await?;
-        let block = transaction
-            .chain()
-            .block_schema()
-            .get_block(block_number)
+        let block = self
+            .database
+            .load_block(&mut transaction, block_number)
             .await?;
         let block_info = if let Some(block) = block {
-            let witness = transaction
-                .prover_schema()
-                .get_witness(block_number)
+            let witness = self
+                .database
+                .load_witness(&mut transaction, block_number)
                 .await?;
             if witness.is_none() {
                 BlockInfo::NoWitness(block)
@@ -94,42 +97,53 @@ impl WitnessGenerator {
             BlockInfo::NotReadyBlock
         };
         transaction.commit().await?;
+        metrics::histogram!("witness_generator", start.elapsed(), "stage" => "should_work_on_block");
         Ok(block_info)
     }
 
     async fn load_account_tree(
         &self,
         block: BlockNumber,
-        storage: &mut StorageProcessor<'_>,
     ) -> Result<CircuitAccountTree, anyhow::Error> {
-        let start = time::Instant::now();
-        let mut circuit_account_tree = CircuitAccountTree::new(account_tree_depth());
+        let fn_start = Instant::now();
 
-        if let Some((cached_block, account_tree_cache)) = storage
-            .chain()
-            .block_schema()
-            .get_account_tree_cache()
-            .await?
-        {
-            let (_, accounts) = storage
-                .chain()
-                .state_schema()
-                .load_committed_state(Some(block))
+        let mut storage = self.database.acquire_connection().await?;
+
+        let start = Instant::now();
+        let mut circuit_account_tree = CircuitAccountTree::new(account_tree_depth());
+        let cache = self.database.load_account_tree_cache(&mut storage).await?;
+        metrics::histogram!("witness_generator", start.elapsed(), "stage" => "load_cache");
+
+        let start = Instant::now();
+        if let Some((cached_block, account_tree_cache)) = cache {
+            let (_, accounts) = self
+                .database
+                .load_committed_state(&mut storage, Some(block))
                 .await?;
             for (id, account) in accounts {
-                circuit_account_tree.insert(id, account.into());
+                circuit_account_tree.insert(*id, account.into());
             }
-            circuit_account_tree.set_internals(serde_json::from_value(account_tree_cache)?);
+            circuit_account_tree.set_internals(
+                SparseMerkleTreeSerializableCacheBN256::decode_bincode(&account_tree_cache),
+            );
             if block != cached_block {
-                let (_, accounts) = storage
-                    .chain()
-                    .state_schema()
-                    .load_committed_state(Some(block))
+                // There is no relevant cache, so we have to use some outdated cache and update the tree.
+                if *block == *cached_block + 1 {
+                    // Off by 1 misses are normally expected
+                    metrics::increment_counter!("witness_generator.cache_access", "type" => "off_by_1");
+                } else {
+                    metrics::increment_counter!("witness_generator.cache_access", "type" => "miss");
+                }
+
+                vlog::info!("Reconstructing the cache for the block {} using the cached tree for the block {}", block, cached_block);
+
+                let (_, accounts) = self
+                    .database
+                    .load_committed_state(&mut storage, Some(block))
                     .await?;
-                if let Some((_, account_updates)) = storage
-                    .chain()
-                    .state_schema()
-                    .load_state_diff(block, Some(cached_block))
+                if let Some((_, account_updates)) = self
+                    .database
+                    .load_state_diff(&mut storage, block, Some(cached_block))
                     .await?
                 {
                     let mut updated_accounts = account_updates
@@ -140,40 +154,54 @@ impl WitnessGenerator {
                     updated_accounts.dedup();
                     for idx in updated_accounts {
                         circuit_account_tree
-                            .insert(idx, accounts.get(&idx).cloned().unwrap_or_default().into());
+                            .insert(*idx, accounts.get(&idx).cloned().unwrap_or_default().into());
                     }
                 }
                 circuit_account_tree.root_hash();
-                let account_tree_cache = circuit_account_tree.get_internals();
-                storage
-                    .chain()
-                    .block_schema()
-                    .store_account_tree_cache(block, serde_json::to_value(account_tree_cache)?)
+                metrics::histogram!("witness_generator", start.elapsed(), "stage" => "recreate_tree_from_cache");
+
+                let start = Instant::now();
+                let tree_cache = circuit_account_tree.get_internals().encode_bincode();
+                metrics::histogram!("tree_cache_size", tree_cache.len() as f64);
+
+                self.database
+                    .store_account_tree_cache(&mut storage, block, tree_cache)
                     .await?;
+                metrics::histogram!("witness_generator", start.elapsed(), "stage" => "store_cache");
+            } else {
+                // There exists a cache for the block we are interested in.
+                metrics::increment_counter!("witness_generator.cache_access", "type" => "hit");
             }
         } else {
-            let (_, accounts) = storage
-                .chain()
-                .state_schema()
-                .load_committed_state(Some(block))
+            // There are no caches at all.
+            let (_, accounts) = self
+                .database
+                .load_committed_state(&mut storage, Some(block))
                 .await?;
             for (id, account) in accounts {
-                circuit_account_tree.insert(id, account.into());
+                circuit_account_tree.insert(*id, account.into());
             }
             circuit_account_tree.root_hash();
-            let account_tree_cache = circuit_account_tree.get_internals();
-            storage
-                .chain()
-                .block_schema()
-                .store_account_tree_cache(block, serde_json::to_value(account_tree_cache)?)
+
+            metrics::histogram!("witness_generator", start.elapsed(), "stage" => "recreate_tree_from_scratch");
+
+            let start = Instant::now();
+            let tree_cache = circuit_account_tree.get_internals().encode_bincode();
+            metrics::histogram!("tree_cache_size", tree_cache.len() as f64);
+            metrics::histogram!("witness_generator", start.elapsed(), "stage" => "serialize_cache");
+
+            let start = Instant::now();
+            self.database
+                .store_account_tree_cache(&mut storage, block, tree_cache)
                 .await?;
+            metrics::histogram!("witness_generator", start.elapsed(), "stage" => "store_cache");
         }
 
-        if block != 0 {
-            let storage_block = storage
-                .chain()
-                .block_schema()
-                .get_block(block)
+        let start = Instant::now();
+        if block != BlockNumber(0) {
+            let storage_block = self
+                .database
+                .load_block(&mut storage, block)
                 .await?
                 .expect("Block for witness generator must exist");
             assert_eq!(
@@ -182,42 +210,40 @@ impl WitnessGenerator {
                 "account tree root hash restored incorrectly"
             );
         }
+        metrics::histogram!("witness_generator", start.elapsed(), "stage" => "ensure_root_hash");
 
-        metrics::histogram!("witness_generator.load_account_tree", start.elapsed());
+        metrics::histogram!("witness_generator", fn_start.elapsed(), "stage" => "load_account_tree");
         Ok(circuit_account_tree)
     }
 
-    async fn prepare_witness_and_save_it(&self, block: Block) -> Result<(), anyhow::Error> {
-        let start = time::Instant::now();
-        let timer = time::Instant::now();
-        let mut storage = self.conn_pool.access_storage().await?;
+    async fn prepare_witness_and_save_it(&self, block: Block) -> anyhow::Result<()> {
+        let fn_start = Instant::now();
+        let mut storage = self.database.acquire_connection().await?;
 
-        let mut circuit_account_tree = self
-            .load_account_tree(block.block_number - 1, &mut storage)
-            .await?;
-        log::trace!(
-            "Witness generator loading circuit account tree {}s",
-            timer.elapsed().as_secs()
-        );
+        let start = Instant::now();
+        let mut circuit_account_tree = self.load_account_tree(block.block_number - 1).await?;
+        metrics::histogram!("witness_generator", start.elapsed(), "stage" => "load_tree_full");
 
-        let timer = time::Instant::now();
+        let start = Instant::now();
         let witness: ProverData = build_block_witness(&mut circuit_account_tree, &block)?.into();
-        log::trace!(
-            "Witness generator witness build {}s",
-            timer.elapsed().as_secs()
-        );
+        metrics::histogram!("witness_generator", start.elapsed(), "stage" => "build_witness");
 
-        storage
-            .prover_schema()
+        let start = Instant::now();
+        self.database
             .store_witness(
+                &mut storage,
                 block.block_number,
                 serde_json::to_value(witness).expect("Witness serialize to json"),
             )
             .await?;
+        metrics::histogram!("witness_generator", start.elapsed(), "stage" => "store_witness");
 
-        metrics::histogram!(
-            "witness_generator.prepare_witness_and_save_it",
-            start.elapsed()
+        metrics::histogram!("witness_generator", fn_start.elapsed(), "stage" => "prepare_witness_and_save_it");
+
+        metrics::gauge!(
+            "last_processed_block",
+            block.block_number.0 as f64,
+            "stage" => "witness_generator"
         );
         Ok(())
     }
@@ -230,25 +256,33 @@ impl WitnessGenerator {
     ) -> BlockNumber {
         match block_info {
             BlockInfo::NotReadyBlock => current_block, // Keep waiting
-            BlockInfo::WithWitness | BlockInfo::NoWitness(_) => current_block + block_step, // Go to the next block
+            BlockInfo::WithWitness | BlockInfo::NoWitness(_) => {
+                BlockNumber(*current_block + *block_step)
+            } // Go to the next block
         }
     }
 
     /// Updates witness data in database in an infinite loop,
     /// awaiting `rounds_interval` time between updates.
     async fn maintain(self) {
-        log::info!(
+        vlog::info!(
             "preparing prover data routine started with start_block({}), block_step({})",
-            self.start_block,
-            self.block_step
+            *self.start_block,
+            *self.block_step
         );
+
+        // Initialize counters for cache hits/misses.
+        metrics::register_counter!("witness_generator.cache_access", "type" => "hit");
+        metrics::register_counter!("witness_generator.cache_access", "type" => "off_by_1");
+        metrics::register_counter!("witness_generator.cache_access", "type" => "miss");
+
         let mut current_block = self.start_block;
         loop {
-            std::thread::sleep(self.rounds_interval);
+            sleep(self.rounds_interval).await;
             let should_work = match self.should_work_on_block(current_block).await {
                 Ok(should_work) => should_work,
                 Err(err) => {
-                    log::warn!("witness for block {} check failed: {}", current_block, err);
+                    vlog::warn!("witness for block {} check failed: {}", current_block, err);
                     continue;
                 }
             };
@@ -257,7 +291,7 @@ impl WitnessGenerator {
             if let BlockInfo::NoWitness(block) = should_work {
                 let block_number = block.block_number;
                 if let Err(err) = self.prepare_witness_and_save_it(block).await {
-                    log::warn!("Witness generator ({},{}) failed to prepare witness for block: {}, err: {}",
+                    vlog::warn!("Witness generator ({},{}) failed to prepare witness for block: {}, err: {}",
                         self.start_block, self.block_step, block_number, err);
                     continue; // Retry the same block on the next iteration.
                 }
@@ -272,23 +306,32 @@ impl WitnessGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::database::Database;
     use zksync_crypto::Fr;
-    use zksync_types::{H256, U256};
+    use zksync_types::{AccountId, H256, U256};
 
     #[test]
     fn test_next_witness_block() {
         assert_eq!(
-            WitnessGenerator::next_witness_block(3, 4, &BlockInfo::NotReadyBlock),
-            3
+            WitnessGenerator::<Database>::next_witness_block(
+                BlockNumber(3),
+                BlockNumber(4),
+                &BlockInfo::NotReadyBlock
+            ),
+            BlockNumber(3)
         );
         assert_eq!(
-            WitnessGenerator::next_witness_block(3, 4, &BlockInfo::WithWitness),
-            7
+            WitnessGenerator::<Database>::next_witness_block(
+                BlockNumber(3),
+                BlockNumber(4),
+                &BlockInfo::WithWitness
+            ),
+            BlockNumber(7)
         );
         let empty_block = Block::new(
-            0,
+            BlockNumber(0),
             Fr::default(),
-            0,
+            AccountId(0),
             vec![],
             (0, 0),
             0,
@@ -298,8 +341,12 @@ mod tests {
             0,
         );
         assert_eq!(
-            WitnessGenerator::next_witness_block(3, 4, &BlockInfo::NoWitness(empty_block)),
-            7
+            WitnessGenerator::<Database>::next_witness_block(
+                BlockNumber(3),
+                BlockNumber(4),
+                &BlockInfo::NoWitness(empty_block)
+            ),
+            BlockNumber(7)
         );
     }
 }

@@ -2,36 +2,36 @@
 use num::BigUint;
 use std::collections::HashMap;
 use web3::types::TransactionReceipt;
-use zksync_config::{ConfigurationOptions, EthClientOptions};
+use zksync_config::ZkSyncConfig;
 use zksync_types::block::Block;
 use zksync_types::TokenId;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TestkitConfig {
-    pub chain_id: u8,
+    pub chain_id: u64,
     pub gas_price_factor: f64,
     pub web3_url: String,
-    pub available_block_chunk_sizes: Vec<usize>,
+    pub contract_upgrade_eth_blocks: Vec<u64>,
+    pub init_contract_version: u32,
 }
 
 impl TestkitConfig {
     pub fn from_env() -> Self {
-        let env_config = ConfigurationOptions::from_env();
-        let eth_client_options = EthClientOptions::from_env();
-
+        let config = ZkSyncConfig::from_env();
         TestkitConfig {
-            chain_id: eth_client_options.chain_id,
-            gas_price_factor: eth_client_options.gas_price_factor,
-            web3_url: env_config.web3_url,
-            available_block_chunk_sizes: env_config.available_block_chunk_sizes,
+            chain_id: config.eth_client.chain_id,
+            gas_price_factor: config.eth_client.gas_price_factor,
+            web3_url: config.eth_client.web3_url(),
+            contract_upgrade_eth_blocks: config.contracts.upgrade_eth_blocks,
+            init_contract_version: config.contracts.init_contract_version,
         }
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct ETHAccountId(pub usize);
 
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct ZKSyncAccountId(pub usize);
 
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
@@ -43,6 +43,7 @@ pub struct BlockExecutionResult {
     pub commit_result: TransactionReceipt,
     pub verify_result: TransactionReceipt,
     pub withdrawals_result: TransactionReceipt,
+    pub pending_withdrawals_result: Option<TransactionReceipt>,
     pub block_size_chunks: usize,
 }
 
@@ -52,6 +53,7 @@ impl BlockExecutionResult {
         commit_result: TransactionReceipt,
         verify_result: TransactionReceipt,
         withdrawals_result: TransactionReceipt,
+        pending_withdrawals_result: Option<TransactionReceipt>,
         block_size_chunks: usize,
     ) -> Self {
         Self {
@@ -59,13 +61,14 @@ impl BlockExecutionResult {
             commit_result,
             verify_result,
             withdrawals_result,
+            pending_withdrawals_result,
             block_size_chunks,
         }
     }
 }
 
 // Struct used to keep expected balance changes after transactions execution.
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct ExpectedAccountState {
     pub eth_accounts_state: HashMap<(ETHAccountId, TokenId), BigUint>,
     pub sync_accounts_state: HashMap<(ZKSyncAccountId, TokenId), BigUint>,

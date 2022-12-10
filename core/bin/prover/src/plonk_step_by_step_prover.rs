@@ -1,12 +1,17 @@
-use crate::{ProverConfig, ProverImpl};
+// Built-in deps
 use std::sync::Mutex;
-use zksync_config::AvailableBlockSizesConfig;
-use zksync_crypto::proof::{AggregatedProof, SingleProof};
+// Workspace deps
+use zksync_config::ChainConfig;
+use zksync_crypto::proof::{AggregatedProof, PrecomputedSampleProofs, SingleProof};
 use zksync_crypto::Engine;
 use zksync_prover_utils::aggregated_proofs::{gen_aggregate_proof, prepare_proof_data};
 use zksync_prover_utils::api::{JobRequestData, JobResultData};
 use zksync_prover_utils::{PlonkVerificationKey, SetupForStepByStepProver};
-use zksync_utils::{get_env, parse_env};
+use zksync_utils::parse_env;
+// Local deps
+use crate::{ProverConfig, ProverImpl};
+use tokio::time::Instant;
+use zksync_prover_utils::fs_utils::load_precomputed_proofs;
 
 /// We prepare some data before making proof for each block size, so we cache it in case next block
 /// would be of our size
@@ -18,28 +23,29 @@ struct PreparedComputations {
 pub struct PlonkStepByStepProver {
     config: PlonkStepByStepProverConfig,
     prepared_computations: Mutex<Option<PreparedComputations>>,
+    precomputed_sample_proofs: PrecomputedSampleProofs,
 }
 
 pub struct PlonkStepByStepProverConfig {
     pub all_block_sizes: Vec<usize>,
     pub block_sizes: Vec<usize>,
     pub download_setup_from_network: bool,
+    pub aggregated_proof_sizes_with_setup_pow: Vec<(usize, u32)>,
 }
 
 impl ProverConfig for PlonkStepByStepProverConfig {
     fn from_env() -> Self {
-        let all_block_sizes = get_env("SUPPORTED_BLOCK_CHUNKS_SIZES")
-            .split(',')
-            .map(|p| p.parse().unwrap())
-            .collect();
-        let block_sizes = get_env("BLOCK_CHUNK_SIZES")
-            .split(',')
-            .map(|p| p.parse().unwrap())
-            .collect();
+        let env_config = ChainConfig::from_env();
+
+        let aggregated_proof_sizes_with_setup_pow = env_config
+            .circuit
+            .supported_aggregated_proof_sizes_with_setup_pow();
+
         Self {
-            all_block_sizes,
-            block_sizes,
-            download_setup_from_network: parse_env("PROVER_DOWNLOAD_SETUP"),
+            download_setup_from_network: parse_env("MISC_PROVER_DOWNLOAD_SETUP"),
+            all_block_sizes: env_config.circuit.supported_block_chunks_sizes,
+            block_sizes: env_config.state_keeper.block_chunk_sizes,
+            aggregated_proof_sizes_with_setup_pow,
         }
     }
 }
@@ -50,7 +56,6 @@ impl PlonkStepByStepProver {
         witness: zksync_circuit::circuit::ZkSyncCircuit<'_, Engine>,
         block_size: usize,
     ) -> anyhow::Result<SingleProof> {
-        // we do this way here so old precomp is dropped
         let valid_cached_precomp = {
             self.prepared_computations
                 .lock()
@@ -58,6 +63,7 @@ impl PlonkStepByStepProver {
                 .take()
                 .filter(|p| p.block_size == block_size)
         };
+
         let precomp = if let Some(precomp) = valid_cached_precomp {
             precomp
         } else {
@@ -82,18 +88,48 @@ impl PlonkStepByStepProver {
         &self,
         proofs: Vec<(SingleProof, usize)>,
     ) -> anyhow::Result<AggregatedProof> {
+        let start = Instant::now();
         // drop setup cache
         {
             self.prepared_computations.lock().unwrap().take();
         }
-        let (vks, proof_data) = prepare_proof_data(&self.config.all_block_sizes, proofs);
 
-        let aggregated_proof_sizes_with_setup_pow =
-            AvailableBlockSizesConfig::from_env().aggregated_proof_sizes_with_setup_pow();
+        let proofs_to_pad = {
+            let aggregate_size = self.config.aggregated_proof_sizes_with_setup_pow.iter().find(|(aggregate_size, _)| aggregate_size >= &proofs.len())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Failed to find aggregate proof size to fit all proofs, size: {:?}, proofs: {}", self.config.aggregated_proof_sizes_with_setup_pow, proofs.len())
+                })?.0;
+            aggregate_size
+                .checked_sub(proofs.len())
+                .expect("Aggregate size should be <= number of proofs")
+        };
+
+        if proofs_to_pad > 0 {
+            vlog::info!(
+                "Padding aggregated proofs. proofs: {}, proofs to pad: {}, aggregate_size: {}",
+                proofs.len(),
+                proofs_to_pad,
+                proofs.len() + proofs_to_pad
+            );
+        }
+
+        let padded_proofs = proofs
+            .into_iter()
+            .chain(
+                self.precomputed_sample_proofs
+                    .single_proofs
+                    .iter()
+                    .cloned()
+                    .take(proofs_to_pad),
+            )
+            .collect();
+
+        let (vks, proof_data) = prepare_proof_data(&self.config.all_block_sizes, padded_proofs);
+        metrics::histogram!("prover", start.elapsed(), "stage" => "prepare_proof", "type" => "aggregated_proof");
         gen_aggregate_proof(
             vks,
             proof_data,
-            &aggregated_proof_sizes_with_setup_pow,
+            &self.config.aggregated_proof_sizes_with_setup_pow,
             self.config.download_setup_from_network,
         )
     }
@@ -117,7 +153,9 @@ impl ProverImpl for PlonkStepByStepProver {
                 JobResultData::AggregatedBlockProof(aggregate_proof)
             }
             JobRequestData::BlockProof(zksync_circuit, block_size) => {
+                let start = Instant::now();
                 let zksync_circuit = zksync_circuit.into_circuit();
+                metrics::histogram!("prover", start.elapsed(), "stage" => "prepare_proof", "type" => "single_proof");
                 let proof = self
                     .create_single_block_proof(zksync_circuit, block_size)
                     .map_err(|e| {
@@ -140,6 +178,8 @@ impl ProverImpl for PlonkStepByStepProver {
         PlonkStepByStepProver {
             config,
             prepared_computations: Mutex::new(None),
+            precomputed_sample_proofs: load_precomputed_proofs()
+                .expect("Failed to load precomputed sample proofs"),
         }
     }
 }

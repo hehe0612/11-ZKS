@@ -25,7 +25,9 @@ Cargo.lock
 
 /etc/env/*
 !/etc/env/dev.env.example
+!/etc/env/docker.env
 !/etc/env/ci.env
+!/etc/env/base
 /etc/tokens/localhost.json
 !/keys
 /keys/*
@@ -34,6 +36,7 @@ Cargo.lock
 /volumes
 /logs
 /loadtest-config
+/core/tests/blocks.json
 
 .ipynb_checkpoints
 
@@ -42,3 +45,7 @@ loadtest_accounts_*
 go_to_env.sh
 
 core/lib/storage/.env
+
+# Perf/flamegraph files
+perf.data*
+flamegraph.svg

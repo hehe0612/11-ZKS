@@ -34,6 +34,17 @@ pub fn pack_token_amount(amount: &BigUint) -> Vec<u8> {
     )
 }
 
+/// Transforms the token amount into packed form.
+/// If the provided token amount is not packable, it is rounded up to the
+/// closest amount that fits in packed form. As a result, some precision will be lost.
+pub fn pack_token_amount_up(amount: &BigUint) -> Vec<u8> {
+    FloatConversions::pack_up(
+        amount,
+        params::AMOUNT_EXPONENT_BIT_WIDTH,
+        params::AMOUNT_MANTISSA_BIT_WIDTH,
+    )
+}
+
 /// Transforms the fee amount into the packed form.
 /// As the packed form for fee is smaller than one for the token,
 /// the same value must be packable as a token amount, but not packable
@@ -42,6 +53,20 @@ pub fn pack_token_amount(amount: &BigUint) -> Vec<u8> {
 /// closest amount that fits in packed form. As a result, some precision will be lost.
 pub fn pack_fee_amount(amount: &BigUint) -> Vec<u8> {
     FloatConversions::pack(
+        amount,
+        params::FEE_EXPONENT_BIT_WIDTH,
+        params::FEE_MANTISSA_BIT_WIDTH,
+    )
+}
+
+/// Transforms the fee amount into the packed form.
+/// As the packed form for fee is smaller than one for the token,
+/// the same value must be packable as a token amount, but not packable
+/// as a fee amount.
+/// If the provided fee amount is not packable, it is rounded up to the
+/// closest amount that fits in packed form. As a result, some precision will be lost.
+pub fn pack_fee_amount_up(amount: &BigUint) -> Vec<u8> {
+    FloatConversions::pack_up(
         amount,
         params::FEE_EXPONENT_BIT_WIDTH,
         params::FEE_MANTISSA_BIT_WIDTH,
@@ -81,14 +106,28 @@ pub fn unpack_fee_amount(data: &[u8]) -> Option<BigUint> {
 /// Returns the closest possible packable token amount.
 /// Returned amount is always less or equal to the provided amount.
 pub fn closest_packable_fee_amount(amount: &BigUint) -> BigUint {
-    let fee_packed = pack_fee_amount(&amount);
+    let fee_packed = pack_fee_amount(amount);
+    unpack_fee_amount(&fee_packed).expect("fee repacking")
+}
+
+/// Returns the closest possible packable token amount.
+/// Returned amount is always greater or equal to the provided amount.
+pub fn closest_greater_or_eq_packable_fee_amount(amount: &BigUint) -> BigUint {
+    let fee_packed = pack_fee_amount_up(amount);
     unpack_fee_amount(&fee_packed).expect("fee repacking")
 }
 
 /// Returns the closest possible packable fee amount.
 /// Returned amount is always less or equal to the provided amount.
 pub fn closest_packable_token_amount(amount: &BigUint) -> BigUint {
-    let fee_packed = pack_token_amount(&amount);
+    let fee_packed = pack_token_amount(amount);
+    unpack_token_amount(&fee_packed).expect("token amount repacking")
+}
+
+/// Returns the closest possible packable fee amount.
+/// Returned amount is always greater or equal to the provided amount.
+pub fn closest_greater_or_eq_packable_token_amount(amount: &BigUint) -> BigUint {
+    let fee_packed = pack_token_amount_up(amount);
     unpack_token_amount(&fee_packed).expect("token amount repacking")
 }
 
@@ -97,10 +136,11 @@ mod test {
     use super::*;
     use crate::TokenLike;
     use serde::{Deserialize, Serialize};
+    use zksync_basic_types::TokenId;
 
     #[test]
     fn test_roundtrip() {
-        let zero = BigUint::from_u32(1).unwrap();
+        let zero = BigUint::from_u32(0).unwrap();
         let one = BigUint::from_u32(1).unwrap();
         {
             let round_trip_zero = unpack_token_amount(&pack_token_amount(&zero));
@@ -206,7 +246,7 @@ mod test {
             ),
             (
                 Query {
-                    token: TokenLike::Id(14),
+                    token: TokenLike::Id(TokenId(14)),
                 },
                 r#"{"token":14}"#,
             ),

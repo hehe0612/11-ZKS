@@ -3,11 +3,12 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as zksync from 'zksync';
 import { ethers } from 'ethers';
+import { web3Provider } from './utils';
 
 const DEPOSIT_AMOUNT = ethers.utils.parseEther('10000000000');
-const network = process.env.ETH_NETWORK;
+const network = process.env.CHAIN_ETH_NETWORK;
 
-const provider = new ethers.providers.JsonRpcProvider(process.env.WEB3_URL);
+const provider = web3Provider();
 const testConfigPath = path.join(process.env.ZKSYNC_HOME as string, `etc/test_config/constant`);
 const ethTestConfig = JSON.parse(fs.readFileSync(`${testConfigPath}/eth.json`, { encoding: 'utf-8' }));
 
@@ -61,7 +62,7 @@ async function main() {
             type: 'function'
         }
     ];
-    if (process.env.NETWORK !== 'localhost') {
+    if (process.env.CHAIN_ETH_NETWORK !== 'localhost') {
         const erc20Mintable = new ethers.Contract(TOKEN_ADDRESS, ABI, deployerEthWallet);
         const mintTx = await erc20Mintable.mint(deployerEthWallet.address, DEPOSIT_AMOUNT);
         await mintTx.wait();
@@ -78,11 +79,16 @@ async function main() {
     console.log('Deposit successful');
 
     if (!(await faucetWallet.isSigningKeySet())) {
-        const setSigningKey = await faucetWallet.setSigningKey({ feeToken: 'MLTT' });
+        const setSigningKey = await faucetWallet.setSigningKey({ feeToken: 'MLTT', ethAuthType: 'ECDSA' });
         await setSigningKey.awaitReceipt();
         console.log('Signing key is set');
     }
     console.log('Faucet account is prepared');
 }
 
-main();
+main()
+    .then(() => process.exit(0))
+    .catch((err) => {
+        console.error('Error:', err.message || err);
+        process.exit(1);
+    });

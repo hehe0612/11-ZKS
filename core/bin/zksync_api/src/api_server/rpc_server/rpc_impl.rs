@@ -1,23 +1,31 @@
 use std::collections::HashMap;
 use std::time::Instant;
 // External uses
+use bigdecimal::BigDecimal;
 use jsonrpc_core::{Error, Result};
-use num::BigUint;
 // Workspace uses
-use zksync_types::{
-    helpers::closest_packable_fee_amount,
-    tx::{TxEthSignature, TxHash},
-    Address, Token, TokenLike, TxFeeTypes, ZkSyncTx,
+use zksync_api_types::{
+    v02::{
+        fee::ApiTxFeeTypes,
+        token::ApiNFT,
+        transaction::{Toggle2FA, Toggle2FAResponse},
+    },
+    TxWithSignature,
 };
-
+use zksync_crypto::params::MIN_NFT_TOKEN_ID;
+use zksync_types::{
+    tx::{EthBatchSignatures, TxEthSignatureVariant, TxHash},
+    AccountId, Address, Fee, Token, TokenId, TokenLike, TotalFee, TxFeeTypes, ZkSyncTx,
+};
 // Local uses
 use crate::{
-    api_server::tx_sender::SubmitError,
-    fee_ticker::{BatchFee, Fee, TokenPriceRequestType},
+    api_server::{
+        helpers::get_depositing, rpc_server::error::RpcErrorCodes, tx_sender::SubmitError,
+    },
+    fee_ticker::TokenPriceRequestType,
 };
-use bigdecimal::BigDecimal;
 
-use super::{error::*, types::*, RpcApp};
+use super::{types::*, RpcApp};
 
 impl RpcApp {
     pub async fn _impl_account_info(self, address: Address) -> Result<AccountInfoResp> {
@@ -25,24 +33,53 @@ impl RpcApp {
 
         let account_state = self.get_account_state(address).await?;
 
-        let depositing_ops = self.get_ongoing_deposits_impl(address).await?;
-        let depositing =
-            DepositingAccountBalances::from_pending_ops(depositing_ops, &self.tx_sender.tokens)
-                .await?;
+        let mut storage = self.access_storage().await?;
+        let depositing = get_depositing(
+            &mut storage,
+            &self.tx_sender.tokens,
+            address,
+            self.confirmations_for_eth_event,
+        )
+        .await
+        .map_err(|err| {
+            vlog::warn!(
+                "[{}:{}:{}] Internal Server Error: '{:?}'; input: N/A",
+                file!(),
+                line!(),
+                column!(),
+                err
+            );
+            Error::internal_error()
+        })?;
+        let account_type = if let Some(account_id) = account_state.account_id {
+            storage
+                .chain()
+                .account_schema()
+                .account_type_by_id(account_id)
+                .await
+                .map_err(|err| {
+                    vlog::warn!(
+                        "[{}:{}:{}] Internal Server Error: '{}'; input: N/A",
+                        file!(),
+                        line!(),
+                        column!(),
+                        err
+                    );
+                    Error::internal_error()
+                })?
+                .map(|t| t.into())
+        } else {
+            None
+        };
 
-        log::trace!(
-            "account_info: address {}, total request processing {}ms",
-            &address,
-            start.elapsed().as_millis()
-        );
-
-        metrics::histogram!("api.rpc.account_info", start.elapsed());
+        metrics::histogram!("api", start.elapsed(), "type" => "rpc", "endpoint_name" => "account_info");
         Ok(AccountInfoResp {
             address,
             id: account_state.account_id,
             committed: account_state.committed,
             verified: account_state.verified,
             depositing,
+            account_type,
         })
     }
 
@@ -66,7 +103,7 @@ impl RpcApp {
             }
         };
 
-        metrics::histogram!("api.rpc.ethop_info", start.elapsed());
+        metrics::histogram!("api", start.elapsed(), "type" => "rpc", "endpoint_name" => "ethop_info");
         Ok(result)
     }
 
@@ -77,7 +114,7 @@ impl RpcApp {
     pub async fn _impl_tx_info(self, tx_hash: TxHash) -> Result<TransactionInfoResp> {
         let start = Instant::now();
         let stored_receipt = self.get_tx_receipt(tx_hash).await?;
-        metrics::histogram!("api.rpc.tx_info", start.elapsed());
+        metrics::histogram!("api", start.elapsed(), "type" => "rpc", "endpoint_name" => "tx_info");
         Ok(if let Some(stored_receipt) = stored_receipt {
             TransactionInfoResp {
                 executed: true,
@@ -99,42 +136,78 @@ impl RpcApp {
         })
     }
 
+    #[allow(deprecated)]
     pub async fn _impl_tx_submit(
         self,
         tx: Box<ZkSyncTx>,
-        signature: Box<Option<TxEthSignature>>,
+        signature: Box<TxEthSignatureVariant>,
         fast_processing: Option<bool>,
+        extracted_request_metadata: Option<RequestMetadata>,
     ) -> Result<TxHash> {
         let start = Instant::now();
+
         let result = self
             .tx_sender
-            .submit_tx(*tx, *signature, fast_processing)
-            .await
-            .map_err(Error::from);
-        metrics::histogram!("api.rpc.tx_submit", start.elapsed());
-        result
+            .submit_tx_with_separate_fp(
+                *tx,
+                *signature,
+                fast_processing,
+                extracted_request_metadata,
+            )
+            .await;
+        if let Err(err) = &result {
+            let err_label = match err {
+                SubmitError::IncorrectTx(err) => err.clone(),
+                SubmitError::TxAdd(err) => err.to_string(),
+                _ => "other".to_string(),
+            };
+            let labels = vec![("stage", "api".to_string()), ("error", err_label)];
+            metrics::increment_counter!("rejected_txs", &labels);
+        }
+
+        metrics::histogram!("api", start.elapsed(), "type" => "rpc", "endpoint_name" => "tx_submit");
+        result.map_err(Error::from)
     }
 
     pub async fn _impl_submit_txs_batch(
         self,
         txs: Vec<TxWithSignature>,
-        eth_signatures: Vec<TxEthSignature>,
+        eth_signatures: Option<EthBatchSignatures>,
+        extracted_request_metadata: Option<RequestMetadata>,
     ) -> Result<Vec<TxHash>> {
         let start = Instant::now();
+
         let result = self
             .tx_sender
-            .submit_txs_batch(txs, eth_signatures)
+            .submit_txs_batch(txs, eth_signatures, extracted_request_metadata)
             .await
-            .map_err(Error::from);
-        metrics::histogram!("api.rpc.submit_txs_batch", start.elapsed());
-        result
+            .map(|response| {
+                response
+                    .transaction_hashes
+                    .into_iter()
+                    .map(|tx_hash| tx_hash.0)
+                    .collect()
+            });
+
+        if let Err(err) = &result {
+            let err_label = match err {
+                SubmitError::IncorrectTx(err) => err.clone(),
+                SubmitError::TxAdd(err) => err.to_string(),
+                _ => "other".to_string(),
+            };
+            let labels = vec![("stage", "api".to_string()), ("error", err_label)];
+            metrics::increment_counter!("rejected_txs", &labels);
+        }
+
+        metrics::histogram!("api", start.elapsed(), "type" => "rpc", "endpoint_name" => "submit_txs_batch");
+        result.map_err(Error::from)
     }
 
     pub async fn _impl_contract_address(self) -> Result<ContractAddressResp> {
         let start = Instant::now();
         let mut storage = self.access_storage().await?;
         let config = storage.config_schema().load_config().await.map_err(|err| {
-            log::warn!(
+            vlog::warn!(
                 "[{}:{}:{}] Internal Server Error: '{}'; input: N/A",
                 file!(),
                 line!(),
@@ -153,36 +226,41 @@ impl RpcApp {
             .gov_contract_addr
             .expect("Server config doesn't contain the gov contract address");
 
-        metrics::histogram!("api.rpc.contract_address", start.elapsed());
+        metrics::histogram!("api", start.elapsed(), "type" => "rpc", "endpoint_name" => "contract_address");
         Ok(ContractAddressResp {
             main_contract,
             gov_contract,
         })
     }
 
+    pub async fn _impl_get_nft(self, id: TokenId) -> Result<Option<ApiNFT>> {
+        let start = Instant::now();
+        let mut storage = self.access_storage().await?;
+        let nft = storage
+            .tokens_schema()
+            .get_nft_with_factories(id)
+            .await
+            .map_err(|err| {
+                vlog::warn!("Internal Server Error: '{}'; input: N/A", err);
+                Error::internal_error()
+            })?;
+
+        metrics::histogram!("api", start.elapsed(), "type" => "rpc", "endpoint_name" => "get_nft");
+        Ok(nft)
+    }
+
     pub async fn _impl_tokens(self) -> Result<HashMap<String, Token>> {
         let start = Instant::now();
         let mut storage = self.access_storage().await?;
         let mut tokens = storage.tokens_schema().load_tokens().await.map_err(|err| {
-            log::warn!("Internal Server Error: '{}'; input: N/A", err);
+            vlog::warn!("Internal Server Error: '{}'; input: N/A", err);
             Error::internal_error()
         })?;
 
-        // HACK: Special case for the Golem:
-        //
-        // Currently, their token on Rinkeby is called GNT, but it's being renamed to the tGLM.
-        //
-        // TODO: Remove this case after Golem update [ZKS-173]
-        let mut has_gnt = None;
-        let mut result: HashMap<_, _> = tokens
+        let result: HashMap<_, _> = tokens
             .drain()
             .map(|(id, token)| {
-                // TODO: Remove this case after Golem update [ZKS-173]
-                if token.symbol == "GNT" {
-                    has_gnt = Some(token.clone());
-                }
-
-                if id == 0 {
+                if *id == 0 {
                     ("ETH".to_string(), token)
                 } else {
                     (token.symbol.clone(), token)
@@ -190,41 +268,62 @@ impl RpcApp {
             })
             .collect();
 
-        // So if we have `GNT` token in response we should also add `GLM` alias.
-        // TODO: Remove this case after Golem update [ZKS-173]
-        if let Some(mut token) = has_gnt {
-            token.symbol = "tGLM".to_string();
-            result.insert(token.symbol.clone(), token);
-        }
-
-        metrics::histogram!("api.rpc.tokens", start.elapsed());
+        metrics::histogram!("api", start.elapsed(), "type" => "rpc", "endpoint_name" => "tokens");
         Ok(result)
     }
 
     pub async fn _impl_get_tx_fee(
         self,
-        tx_type: TxFeeTypes,
+        tx_type: ApiTxFeeTypes,
         address: Address,
         token: TokenLike,
+        extracted_request_metadata: Option<RequestMetadata>,
     ) -> Result<Fee> {
         let start = Instant::now();
-        let ticker = self.tx_sender.ticker_requests.clone();
-        let token_allowed = Self::token_allowed_for_fees(ticker.clone(), token.clone()).await?;
+        let token_allowed = self
+            .tx_sender
+            .ticker
+            .token_allowed_for_fees(token.clone())
+            .await
+            .map_err(SubmitError::Internal)?;
         if !token_allowed {
             return Err(SubmitError::InappropriateFeeToken.into());
         }
 
-        let result = Self::ticker_request(ticker.clone(), tx_type, address, token).await;
-        metrics::histogram!("api.rpc.get_tx_fee", start.elapsed());
-        result
+        let result = self
+            .tx_sender
+            .ticker
+            .get_fee_from_ticker_in_wei(tx_type.into(), token.clone(), address)
+            .await
+            .map_err(SubmitError::Internal)?;
+
+        let should_subsidize_cpk = self
+            .tx_sender
+            .should_subsidize_cpk(
+                &result.normal_fee.total_fee,
+                &result.subsidized_fee.total_fee,
+                &result.subsidy_size_usd,
+                extracted_request_metadata,
+            )
+            .await?;
+
+        let fee = if should_subsidize_cpk {
+            result.subsidized_fee
+        } else {
+            result.normal_fee
+        };
+
+        metrics::histogram!("api", start.elapsed(), "type" => "rpc", "endpoint_name" => "get_tx_fee");
+        Ok(fee)
     }
 
     pub async fn _impl_get_txs_batch_fee_in_wei(
         self,
-        tx_types: Vec<TxFeeTypes>,
+        tx_types: Vec<ApiTxFeeTypes>,
         addresses: Vec<Address>,
         token: TokenLike,
-    ) -> Result<BatchFee> {
+        extracted_request_metadata: Option<RequestMetadata>,
+    ) -> Result<TotalFee> {
         let start = Instant::now();
         if tx_types.len() != addresses.len() {
             return Err(Error {
@@ -234,35 +333,61 @@ impl RpcApp {
             });
         }
 
-        let ticker = self.tx_sender.ticker_requests.clone();
-        let token_allowed = Self::token_allowed_for_fees(ticker.clone(), token.clone()).await?;
+        let token_allowed = self
+            .tx_sender
+            .ticker
+            .token_allowed_for_fees(token.clone())
+            .await
+            .map_err(|_| Error::internal_error())?;
         if !token_allowed {
             return Err(SubmitError::InappropriateFeeToken.into());
         }
 
-        let mut total_fee = BigUint::from(0u32);
+        let transactions: Vec<(TxFeeTypes, Address)> = (tx_types
+            .iter()
+            .cloned()
+            .map(|fee_type| fee_type.into())
+            .zip(addresses.iter().cloned()))
+        .collect();
 
-        for (tx_type, address) in tx_types.iter().zip(addresses.iter()) {
-            let ticker = ticker.clone();
-            let fee = Self::ticker_request(ticker, *tx_type, *address, token.clone()).await?;
-            total_fee += fee.total_fee;
-        }
-        // Sum of transactions can be unpackable
-        total_fee = closest_packable_fee_amount(&total_fee);
+        let result = self
+            .tx_sender
+            .ticker
+            .get_batch_from_ticker_in_wei(token.clone(), transactions)
+            .await
+            .map_err(SubmitError::Internal)?;
 
-        metrics::histogram!("api.rpc.get_txs_batch_fee_in_wei", start.elapsed());
-        Ok(BatchFee { total_fee })
+        let should_subsidize_cpk = self
+            .tx_sender
+            .should_subsidize_cpk(
+                &result.normal_fee.total_fee,
+                &result.subsidized_fee.total_fee,
+                &result.subsidy_size_usd,
+                extracted_request_metadata,
+            )
+            .await?;
+
+        let fee = if should_subsidize_cpk {
+            result.subsidized_fee
+        } else {
+            result.normal_fee
+        };
+
+        metrics::histogram!("api", start.elapsed(), "type" => "rpc", "endpoint_name" => "get_txs_batch_fee_in_wei");
+        Ok(TotalFee {
+            total_fee: fee.total_fee,
+        })
     }
 
     pub async fn _impl_get_token_price(self, token: TokenLike) -> Result<BigDecimal> {
         let start = Instant::now();
-        let result = Self::ticker_price_request(
-            self.tx_sender.ticker_requests.clone(),
-            token,
-            TokenPriceRequestType::USDForOneToken,
-        )
-        .await;
-        metrics::histogram!("api.rpc.get_token_price", start.elapsed());
+        let result = self
+            .tx_sender
+            .ticker
+            .get_token_price(token, TokenPriceRequestType::USDForOneToken)
+            .await
+            .map_err(|_| Error::internal_error());
+        metrics::histogram!("api", start.elapsed(), "type" => "rpc", "endpoint_name" => "get_token_price");
         result
     }
 
@@ -272,7 +397,58 @@ impl RpcApp {
     ) -> Result<Option<String>> {
         let start = Instant::now();
         let result = self.eth_tx_for_withdrawal(withdrawal_hash).await;
-        metrics::histogram!("api.rpc.get_eth_tx_for_withdrawal", start.elapsed());
+        metrics::histogram!("api", start.elapsed(), "type" => "rpc", "endpoint_name" => "get_eth_tx_for_withdrawal");
         result
+    }
+
+    pub async fn _impl_get_nft_owner(self, id: TokenId) -> Result<Option<AccountId>> {
+        let start = Instant::now();
+        let owner_id = if id.0 < MIN_NFT_TOKEN_ID {
+            None
+        } else {
+            let mut storage = self.access_storage().await?;
+            storage
+                .chain()
+                .account_schema()
+                .get_nft_owner(id)
+                .await
+                .map_err(|err| {
+                    vlog::warn!("Internal Server Error: '{}'; input: N/A", err);
+                    Error::internal_error()
+                })?
+        };
+
+        metrics::histogram!("api", start.elapsed(), "type" => "rpc", "endpoint_name" => "get_nft_owner");
+        Ok(owner_id)
+    }
+
+    pub async fn _impl_toggle_2fa(self, toggle_2fa: Toggle2FA) -> Result<Toggle2FAResponse> {
+        let start = Instant::now();
+        let response = self
+            .tx_sender
+            .toggle_2fa(toggle_2fa)
+            .await
+            .map_err(Error::from);
+
+        metrics::histogram!("api", start.elapsed(), "type" => "rpc", "endpoint_name" => "toggle_2fa");
+        response
+    }
+
+    pub async fn _impl_get_nft_id_by_tx_hash(self, tx_hash: TxHash) -> Result<Option<TokenId>> {
+        let start = Instant::now();
+
+        let mut storage = self.access_storage().await?;
+        let response = storage
+            .chain()
+            .state_schema()
+            .get_nft_id_by_tx_hash(tx_hash)
+            .await
+            .map_err(|err| {
+                vlog::warn!("Internal Server Error: '{}'; input: N/A", err);
+                Error::internal_error()
+            })?;
+
+        metrics::histogram!("api", start.elapsed(), "type" => "rpc", "endpoint_name" => "get_nft_id_by_tx_hash");
+        Ok(response)
     }
 }

@@ -19,17 +19,20 @@ services:
     - type: bind
       source: ./volumes/geth
       target: /var/lib/geth/data
+    environment:
+      - PLUGIN_CONFIG=fast
+  dev-liquidity-token-watcher:
+    image: "matterlabs/dev-liquidity-token-watcher:latest"
+    env_file:
+      - ./etc/env/docker.env
+    ports:
+      - "9975:9975"
+    volumes:
+      - ./etc/tokens/:/etc/tokens
+
   dev-ticker:
     image: "matterlabs/dev-ticker:latest"
     ports:
       - "9876:9876"
-  tesseracts:
-    image: "adria0/tesseracts"
-    command: --cfg /tesseracts.toml -vvv
-    ports:
-      - "8000:8000"
     volumes:
-    - ./etc/tesseracts/tesseracts.toml:/tesseracts.toml
-    - type: bind
-      source: ./volumes/tesseracts
-      target: /var/lib/tesseracts/data
+      - ./etc/tokens/:/etc/tokens

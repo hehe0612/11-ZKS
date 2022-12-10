@@ -3,7 +3,7 @@ use num::ToPrimitive;
 use zksync_crypto::franklin_crypto::{
     bellman::pairing::{
         bn256::{Bn256, Fr},
-        ff::{Field, PrimeField},
+        ff::Field,
     },
     rescue::RescueEngine,
 };
@@ -16,7 +16,7 @@ use zksync_crypto::{
     params::{
         account_tree_depth, ACCOUNT_ID_BIT_WIDTH, AMOUNT_EXPONENT_BIT_WIDTH,
         AMOUNT_MANTISSA_BIT_WIDTH, CHUNK_BIT_WIDTH, FEE_EXPONENT_BIT_WIDTH, FEE_MANTISSA_BIT_WIDTH,
-        NEW_PUBKEY_HASH_WIDTH, NONCE_BIT_WIDTH, TOKEN_BIT_WIDTH, TX_TYPE_BIT_WIDTH,
+        TOKEN_BIT_WIDTH, TX_TYPE_BIT_WIDTH,
     },
     primitives::FloatConversions,
 };
@@ -26,7 +26,7 @@ use crate::{
     operation::{Operation, OperationArguments, OperationBranch, OperationBranchWitness},
     utils::resize_grow_only,
     witness::{
-        utils::{apply_leaf_operation, get_audits, SigDataInput},
+        utils::{apply_leaf_operation, fr_from, get_audits, SigDataInput},
         Witness,
     },
 };
@@ -38,6 +38,8 @@ pub struct TransferData {
     pub token: u32,
     pub from_account_address: u32,
     pub to_account_address: u32,
+    pub valid_from: u64,
+    pub valid_until: u64,
 }
 
 pub struct TransferWitness<E: RescueEngine> {
@@ -59,12 +61,15 @@ impl Witness for TransferWitness<Bn256> {
     type CalculateOpsInput = SigDataInput;
 
     fn apply_tx(tree: &mut CircuitAccountTree, transfer: &TransferOp) -> Self {
+        let time_range = transfer.tx.time_range.unwrap_or_default();
         let transfer_data = TransferData {
             amount: transfer.tx.amount.to_u128().unwrap(),
             fee: transfer.tx.fee.to_u128().unwrap(),
-            token: u32::from(transfer.tx.token),
-            from_account_address: transfer.from,
-            to_account_address: transfer.to,
+            token: *transfer.tx.token as u32,
+            from_account_address: *transfer.from,
+            to_account_address: *transfer.to,
+            valid_from: time_range.valid_from,
+            valid_until: time_range.valid_until,
         };
         // le_bit_vector_into_field_element()
         Self::apply_data(tree, &transfer_data)
@@ -123,7 +128,7 @@ impl Witness for TransferWitness<Bn256> {
         let operation_zero = Operation {
             new_root: self.intermediate_root,
             tx_type: self.tx_type,
-            chunk: Some(Fr::from_str("0").unwrap()),
+            chunk: Some(fr_from(0)),
             pubdata_chunk: Some(pubdata_chunks[0]),
             first_sig_msg: Some(input.first_sig_msg),
             second_sig_msg: Some(input.second_sig_msg),
@@ -138,7 +143,7 @@ impl Witness for TransferWitness<Bn256> {
         let operation_one = Operation {
             new_root: self.after_root,
             tx_type: self.tx_type,
-            chunk: Some(Fr::from_str("1").unwrap()),
+            chunk: Some(fr_from(1)),
             pubdata_chunk: Some(pubdata_chunks[1]),
             first_sig_msg: Some(input.first_sig_msg),
             second_sig_msg: Some(input.second_sig_msg),
@@ -153,59 +158,11 @@ impl Witness for TransferWitness<Bn256> {
     }
 }
 
-impl<E: RescueEngine> TransferWitness<E> {
-    pub fn get_sig_bits(&self) -> Vec<bool> {
-        let mut sig_bits = vec![];
-        append_be_fixed_width(
-            &mut sig_bits,
-            &Fr::from_str("5").unwrap(), //Corresponding tx_type
-            TX_TYPE_BIT_WIDTH,
-        );
-        append_be_fixed_width(
-            &mut sig_bits,
-            &self
-                .from_before
-                .witness
-                .account_witness
-                .pub_key_hash
-                .unwrap(),
-            NEW_PUBKEY_HASH_WIDTH,
-        );
-        append_be_fixed_width(
-            &mut sig_bits,
-            &self.to_before.witness.account_witness.pub_key_hash.unwrap(),
-            NEW_PUBKEY_HASH_WIDTH,
-        );
-
-        append_be_fixed_width(
-            &mut sig_bits,
-            &self.from_before.token.unwrap(),
-            TOKEN_BIT_WIDTH,
-        );
-        append_be_fixed_width(
-            &mut sig_bits,
-            &self.args.amount_packed.unwrap(),
-            AMOUNT_MANTISSA_BIT_WIDTH + AMOUNT_EXPONENT_BIT_WIDTH,
-        );
-        append_be_fixed_width(
-            &mut sig_bits,
-            &self.args.fee.unwrap(),
-            FEE_MANTISSA_BIT_WIDTH + FEE_EXPONENT_BIT_WIDTH,
-        );
-        append_be_fixed_width(
-            &mut sig_bits,
-            &self.from_before.witness.account_witness.nonce.unwrap(),
-            NONCE_BIT_WIDTH,
-        );
-        sig_bits
-    }
-}
-
 impl TransferWitness<Bn256> {
     fn apply_data(tree: &mut CircuitAccountTree, transfer: &TransferData) -> Self {
         //preparing data and base witness
         let before_root = tree.root_hash();
-        log::debug!("Initial root = {}", before_root);
+        vlog::debug!("Initial root = {}", before_root);
         let (audit_path_from_before, audit_balance_path_from_before) =
             get_audits(tree, transfer.from_account_address, transfer.token);
 
@@ -214,11 +171,10 @@ impl TransferWitness<Bn256> {
 
         let capacity = tree.capacity();
         assert_eq!(capacity, 1 << account_tree_depth());
-        let account_address_from_fe =
-            Fr::from_str(&transfer.from_account_address.to_string()).unwrap();
-        let account_address_to_fe = Fr::from_str(&transfer.to_account_address.to_string()).unwrap();
-        let token_fe = Fr::from_str(&transfer.token.to_string()).unwrap();
-        let amount_as_field_element = Fr::from_str(&transfer.amount.to_string()).unwrap();
+        let account_address_from_fe = fr_from(transfer.from_account_address);
+        let account_address_to_fe = fr_from(transfer.to_account_address);
+        let token_fe = fr_from(transfer.token);
+        let amount_as_field_element = fr_from(transfer.amount);
 
         let amount_bits = FloatConversions::to_float(
             transfer.amount,
@@ -230,7 +186,7 @@ impl TransferWitness<Bn256> {
 
         let amount_encoded: Fr = le_bit_vector_into_field_element(&amount_bits);
 
-        let fee_as_field_element = Fr::from_str(&transfer.fee.to_string()).unwrap();
+        let fee_as_field_element = fr_from(transfer.fee);
 
         let fee_bits = FloatConversions::to_float(
             transfer.fee,
@@ -241,6 +197,9 @@ impl TransferWitness<Bn256> {
         .unwrap();
 
         let fee_encoded: Fr = le_bit_vector_into_field_element(&fee_bits);
+
+        let valid_from = transfer.valid_from;
+        let valid_until = transfer.valid_until;
 
         //applying first transfer part
         let (
@@ -253,7 +212,7 @@ impl TransferWitness<Bn256> {
             transfer.from_account_address,
             transfer.token,
             |acc| {
-                acc.nonce.add_assign(&Fr::from_str("1").unwrap());
+                acc.nonce.add_assign(&fr_from(1));
             },
             |bal| {
                 bal.value.sub_assign(&amount_as_field_element);
@@ -262,7 +221,7 @@ impl TransferWitness<Bn256> {
         );
 
         let intermediate_root = tree.root_hash();
-        log::debug!("Intermediate root = {}", intermediate_root);
+        vlog::debug!("Intermediate root = {}", intermediate_root);
 
         let (audit_path_from_intermediate, audit_balance_path_from_intermediate) =
             get_audits(tree, transfer.from_account_address, transfer.token);
@@ -349,26 +308,31 @@ impl TransferWitness<Bn256> {
                 address: Some(account_address_to_fe),
                 token: Some(token_fe),
                 witness: OperationBranchWitness {
-                    account_witness: account_witness_to_after,
+                    account_witness: account_witness_to_after.clone(),
                     account_path: audit_path_to_after,
                     balance_value: Some(balance_to_after),
                     balance_subtree_path: audit_balance_path_to_after,
                 },
             },
             args: OperationArguments {
-                eth_address: Some(Fr::zero()),
                 amount_packed: Some(amount_encoded),
                 full_amount: Some(amount_as_field_element),
                 fee: Some(fee_encoded),
-                pub_nonce: Some(Fr::zero()),
                 a: Some(a),
                 b: Some(b),
-                new_pub_key_hash: Some(Fr::zero()),
+                valid_from: Some(fr_from(valid_from)),
+                valid_until: Some(fr_from(valid_until)),
+                eth_address: Some(
+                    account_witness_to_after
+                        .address
+                        .expect("receiver account should have address on transfer"),
+                ),
+                ..Default::default()
             },
             before_root: Some(before_root),
             intermediate_root: Some(intermediate_root),
             after_root: Some(after_root),
-            tx_type: Some(Fr::from_str("5").unwrap()),
+            tx_type: Some(fr_from(TransferOp::OP_CODE)),
         }
     }
 }

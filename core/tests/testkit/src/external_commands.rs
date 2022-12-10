@@ -2,11 +2,13 @@
 //! `zk` script should be in path.
 //!
 use std::collections::HashMap;
+use std::fs::read;
 use std::process::Command;
 use std::str::FromStr;
 use web3::types::{Address, H256};
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use zksync_crypto::convert::FeConvert;
 use zksync_crypto::Fr;
 
@@ -17,37 +19,56 @@ pub struct Contracts {
     pub contract: Address,
     pub upgrade_gatekeeper: Address,
     pub test_erc20_address: Address,
+    pub pending_withdrawer: (ethabi::Contract, Address),
 }
 
 fn get_contract_address(deploy_script_out: &str) -> Option<(String, Address)> {
-    if let Some(output) = deploy_script_out.strip_prefix("GOVERNANCE_ADDR=0x") {
+    if let Some(output) = deploy_script_out.strip_prefix("CONTRACTS_GOVERNANCE_ADDR=0x") {
         Some((
-            String::from("GOVERNANCE_ADDR"),
+            String::from("CONTRACTS_GOVERNANCE_ADDR"),
             Address::from_str(output).expect("can't parse contract address"),
         ))
-    } else if let Some(output) = deploy_script_out.strip_prefix("VERIFIER_ADDR=0x") {
+    } else if let Some(output) = deploy_script_out.strip_prefix("CONTRACTS_VERIFIER_ADDR=0x") {
         Some((
-            String::from("VERIFIER_ADDR"),
+            String::from("CONTRACTS_VERIFIER_ADDR"),
             Address::from_str(output).expect("can't parse contract address"),
         ))
-    } else if let Some(output) = deploy_script_out.strip_prefix("CONTRACT_ADDR=0x") {
+    } else if let Some(output) = deploy_script_out.strip_prefix("CONTRACTS_CONTRACT_ADDR=0x") {
         Some((
-            String::from("CONTRACT_ADDR"),
+            String::from("CONTRACTS_CONTRACT_ADDR"),
             Address::from_str(output).expect("can't parse contract address"),
         ))
-    } else if let Some(output) = deploy_script_out.strip_prefix("UPGRADE_GATEKEEPER_ADDR=0x") {
+    } else if let Some(output) =
+        deploy_script_out.strip_prefix("CONTRACTS_UPGRADE_GATEKEEPER_ADDR=0x")
+    {
         Some((
-            String::from("UPGRADE_GATEKEEPER_ADDR"),
+            String::from("CONTRACTS_UPGRADE_GATEKEEPER_ADDR"),
             Address::from_str(output).expect("can't parse contract address"),
         ))
-    } else if let Some(output) = deploy_script_out.strip_prefix("TEST_ERC20=0x") {
+    } else if let Some(output) =
+        deploy_script_out.strip_prefix("CONTRACTS_PENDING_BALANCE_WITHDRAWER=0x")
+    {
         Some((
-            String::from("TEST_ERC20"),
+            String::from("CONTRACTS_PENDING_BALANCE_WITHDRAWER"),
             Address::from_str(output).expect("can't parse contract address"),
         ))
     } else {
-        None
+        deploy_script_out
+            .strip_prefix("CONTRACTS_TEST_ERC20=0x")
+            .map(|output| {
+                (
+                    String::from("CONTRACTS_TEST_ERC20"),
+                    Address::from_str(output).expect("can't parse contract address"),
+                )
+            })
     }
+}
+
+fn pending_withdrawer_contract() -> ethabi::Contract {
+    let path = "contracts/artifacts/cache/solpp-generated-contracts/dev-contracts/PendingBalanceWithdrawer.sol/PendingBalanceWithdrawer.json";
+    let pending_withdrawer_abi: Value =
+        serde_json::from_slice(read(path).unwrap().as_slice()).unwrap();
+    serde_json::from_value(pending_withdrawer_abi.get("abi").unwrap().clone()).unwrap()
 }
 
 /// Runs external command and returns stdout output
@@ -70,13 +91,16 @@ fn run_external_command(command: &str, args: &[&str]) -> String {
 }
 
 pub fn js_revert_reason(tx_hash: &H256) -> String {
+    let web3_urls =
+        std::env::var("ETH_CLIENT_WEB3_URL").expect("ETH_CLIENT_WEB3_URL should be installed");
+    let web3_urls: Vec<&str> = web3_urls.split(',').collect();
     run_external_command(
         "zk",
         &[
             "run",
             "revert-reason",
             &format!("0x{:x}", tx_hash),
-            "http://localhost:7545",
+            web3_urls.first().expect("At least one should exist"),
         ],
     )
 }
@@ -99,18 +123,26 @@ pub fn deploy_contracts(use_prod_contracts: bool, genesis_root: Fr) -> Contracts
 
     Contracts {
         governance: contracts
-            .remove("GOVERNANCE_ADDR")
+            .remove("CONTRACTS_GOVERNANCE_ADDR")
             .expect("GOVERNANCE_ADDR missing"),
         verifier: contracts
-            .remove("VERIFIER_ADDR")
+            .remove("CONTRACTS_VERIFIER_ADDR")
             .expect("VERIFIER_ADDR missing"),
         contract: contracts
-            .remove("CONTRACT_ADDR")
+            .remove("CONTRACTS_CONTRACT_ADDR")
             .expect("CONTRACT_ADDR missing"),
         upgrade_gatekeeper: contracts
-            .remove("UPGRADE_GATEKEEPER_ADDR")
+            .remove("CONTRACTS_UPGRADE_GATEKEEPER_ADDR")
             .expect("UPGRADE_GATEKEEPER_ADDR missing"),
-        test_erc20_address: contracts.remove("TEST_ERC20").expect("TEST_ERC20 missing"),
+        test_erc20_address: contracts
+            .remove("CONTRACTS_TEST_ERC20")
+            .expect("TEST_ERC20 missing"),
+        pending_withdrawer: (
+            pending_withdrawer_contract(),
+            contracts
+                .remove("CONTRACTS_PENDING_BALANCE_WITHDRAWER")
+                .expect("CONTRACTS_PENDING_BALANCE_WITHDRAWER missing"),
+        ),
     }
 }
 

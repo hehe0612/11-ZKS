@@ -1,23 +1,30 @@
 //! Utilities for the on-chain operations, such as `Deposit` and `FullExit`.
 
 use num::BigUint;
+use serde_json::{Map, Value};
 use std::{convert::TryFrom, time::Duration};
 use std::{str::FromStr, time::Instant};
 use web3::contract::tokens::Tokenize;
-use web3::contract::{Contract, Options};
+use web3::contract::Options;
 use web3::transports::Http;
 use web3::types::{TransactionReceipt, H160, H256, U256};
-use web3::Web3;
-use zksync_eth_client::ETHClient;
+
+use zksync_eth_client::ETHDirectClient;
 use zksync_eth_signer::EthereumSigner;
-use zksync_types::{AccountId, PriorityOp, TokenLike};
+use zksync_types::{AccountId, Address, PriorityOp, PriorityOpId, TokenId, TokenLike};
 
 use crate::{
     error::ClientError, provider::Provider, tokens_cache::TokensCache, utils::u256_to_biguint,
 };
 
+pub use self::priority_op_handle::PriorityOpHandle;
+use zksync_crypto::params::MIN_NFT_TOKEN_ID;
+
+mod priority_op_handle;
+
 const IERC20_INTERFACE: &str = include_str!("abi/IERC20.json");
 const ZKSYNC_INTERFACE: &str = include_str!("abi/ZkSync.json");
+const RAW_ERC20_DEPOSIT_GAS_LIMIT: &str = include_str!("DepositERC20GasLimit.json");
 
 fn load_contract(raw_abi_string: &str) -> ethabi::Contract {
     let abi_string = serde_json::Value::from_str(raw_abi_string)
@@ -45,9 +52,10 @@ pub fn ierc20_contract() -> ethabi::Contract {
 #[derive(Debug)]
 pub struct EthereumProvider<S: EthereumSigner> {
     tokens_cache: TokensCache,
-    eth_client: ETHClient<Http, S>,
+    eth_client: ETHDirectClient<S>,
     erc20_abi: ethabi::Contract,
     confirmation_timeout: Duration,
+    poll_time: Duration,
 }
 
 impl<S: EthereumSigner> EthereumProvider<S> {
@@ -72,7 +80,7 @@ impl<S: EthereumSigner> EthereumProvider<S> {
                 &address_response.main_contract
             };
 
-        let eth_client = ETHClient::new(
+        let eth_client = ETHDirectClient::new(
             transport,
             zksync_contract(),
             eth_addr,
@@ -89,32 +97,60 @@ impl<S: EthereumSigner> EthereumProvider<S> {
             eth_client,
             erc20_abi,
             tokens_cache,
-            confirmation_timeout: Duration::from_secs(10),
+            confirmation_timeout: Duration::from_secs(30),
+            poll_time: Duration::from_millis(1000),
         })
     }
 
     /// Exposes Ethereum node `web3` API.
-    pub fn web3(&self) -> &Web3<Http> {
-        &self.eth_client.web3
+    pub fn client(&self) -> &ETHDirectClient<S> {
+        &self.eth_client
     }
 
     /// Returns the zkSync contract address.
     pub fn contract_address(&self) -> H160 {
-        self.eth_client.contract_addr
+        self.client().contract_addr()
     }
 
     /// Returns the Ethereum account balance.
     pub async fn balance(&self) -> Result<BigUint, ClientError> {
-        self.eth_client
-            .balance()
+        self.client()
+            .sender_eth_balance()
             .await
             .map_err(|err| ClientError::NetworkError(err.to_string()))
             .map(u256_to_biguint)
     }
 
+    /// Returns the ERC20 token account balance.
+    pub async fn erc20_balance(
+        &self,
+        address: Address,
+        token: impl Into<TokenLike>,
+    ) -> Result<U256, ClientError> {
+        let token = self
+            .tokens_cache
+            .resolve(token.into())
+            .ok_or(ClientError::UnknownToken)?;
+
+        let res = self
+            .eth_client
+            .call_contract_function(
+                "balanceOf",
+                address,
+                None,
+                Options::default(),
+                None,
+                token.address,
+                self.erc20_abi.clone(),
+            )
+            .await
+            .map_err(|err| ClientError::NetworkError(err.to_string()))?;
+        Ok(res)
+    }
+
     /// Returns the pending nonce for the Ethereum account.
     pub async fn nonce(&self) -> Result<U256, ClientError> {
-        self.eth_client
+        self.client()
             .pending_nonce()
             .await
             .map_err(|err| ClientError::NetworkError(err.to_string()))
@@ -141,20 +177,9 @@ impl<S: EthereumSigner> EthereumProvider<S> {
             .resolve(token)
             .ok_or(ClientError::UnknownToken)?;
 
-        let contract = Contract::new(
-            self.eth_client.web3.eth(),
-            token.address,
-            self.erc20_abi.clone(),
-        );
-
-        let query = contract.query(
-            "allowance",
-            (self.eth_client.sender_account, self.contract_address()),
-            None,
-            Options::default(),
-            None,
-        );
-        let current_allowance: U256 = query
+        let current_allowance = self
+            .client()
+            .allowance(token.address, self.erc20_abi.clone())
             .await
             .map_err(|err| ClientError::NetworkError(err.to_string()))?;
 
@@ -193,13 +218,20 @@ impl<S: EthereumSigner> EthereumProvider<S> {
             .expect("failed to encode parameters");
 
         let signed_tx = self
-            .eth_client
-            .sign_prepared_tx_for_addr(data, token.address, Default::default())
+            .client()
+            .sign_prepared_tx_for_addr(
+                data,
+                token.address,
+                Options {
+                    gas: Some(300_000.into()),
+                    ..Default::default()
+                },
+            )
             .await
             .map_err(|_| ClientError::IncorrectCredentials)?;
 
         let transaction_hash = self
-            .eth_client
+            .client()
             .send_raw_tx(signed_tx.raw_tx)
             .await
             .map_err(|err| ClientError::NetworkError(err.to_string()))?;
@@ -222,8 +254,12 @@ impl<S: EthereumSigner> EthereumProvider<S> {
             .ok_or(ClientError::UnknownToken)?;
 
         let signed_tx = if self.tokens_cache.is_eth(token) {
-            let options = Options::with(|options| options.value = Some(amount));
-            self.eth_client
+            let options = Options {
+                value: Some(amount),
+                gas: Some(300_000.into()),
+                ..Default::default()
+            };
+            self.client()
                 .sign_prepared_tx_for_addr(Vec::new(), to, options)
                 .await
                 .map_err(|_| ClientError::IncorrectCredentials)?
@@ -237,8 +273,65 @@ impl<S: EthereumSigner> EthereumProvider<S> {
                 .encode_input(&params.into_tokens())
                 .expect("failed to encode parameters");
 
+            self.client()
+                .sign_prepared_tx_for_addr(
+                    data,
+                    token_info.address,
+                    Options {
+                        gas: Some(300_000.into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(|_| ClientError::IncorrectCredentials)?
+        };
+
+        let transaction_hash = self
+            .client()
+            .send_raw_tx(signed_tx.raw_tx)
+            .await
+            .map_err(|err| ClientError::NetworkError(err.to_string()))?;
+
+        Ok(transaction_hash)
+    }
+
+    #[cfg(feature = "mint")]
+    pub async fn mint_erc20(
+        &self,
+        token: impl Into<TokenLike>,
+        amount: U256,
+        to: H160,
+    ) -> Result<H256, ClientError> {
+        let token = token.into();
+        let token_info = self
+            .tokens_cache
+            .resolve(token.clone())
+            .ok_or(ClientError::UnknownToken)?;
+
+        if self.tokens_cache.is_eth(token) {
+            // ETH minting is not supported
+            return Err(ClientError::IncorrectInput);
+        }
+
+        let signed_tx = {
+            let contract_function = self
+                .erc20_abi
+                .function("mint")
+                .expect("failed to get function parameters");
+            let params = (to, amount);
+            let data = contract_function
+                .encode_input(&params.into_tokens())
+                .expect("failed to encode parameters");
+
             self.eth_client
-                .sign_prepared_tx_for_addr(data, token_info.address, Default::default())
+                .sign_prepared_tx_for_addr(
+                    data,
+                    token_info.address,
+                    Options {
+                        gas: Some(300_000.into()),
+                        ..Default::default()
+                    },
+                )
                 .await
                 .map_err(|_| ClientError::IncorrectCredentials)?
         };
@@ -267,25 +360,46 @@ impl<S: EthereumSigner> EthereumProvider<S> {
             .ok_or(ClientError::UnknownToken)?;
 
         let signed_tx = if self.tokens_cache.is_eth(token) {
-            let mut options = Options::default();
-            options.value = Some(amount);
-            options.gas = Some(200_000.into());
-            self.eth_client
-                .sign_call_tx("depositETH", sync_address, options)
+            let options = Options {
+                value: Some(amount),
+                gas: Some(200_000.into()),
+                ..Default::default()
+            };
+            let data = self.client().encode_tx_data("depositETH", sync_address);
+
+            self.client()
+                .sign_prepared_tx(data, options)
                 .await
                 .map_err(|_| ClientError::IncorrectCredentials)?
         } else {
-            let mut options = Options::default();
-            options.gas = Some(300_000.into());
+            let gas_limits: Map<String, Value> = serde_json::from_str(RAW_ERC20_DEPOSIT_GAS_LIMIT)
+                .map_err(|_| ClientError::Other)?;
+            let address_str = format!("{:?}", token_info.address);
+            let is_mainnet = self.client().chain_id() == 1;
+            let gas_limit = if is_mainnet && gas_limits.contains_key(&address_str) {
+                gas_limits
+                    .get(&address_str)
+                    .unwrap()
+                    .as_u64()
+                    .ok_or(ClientError::Other)?
+            } else {
+                300000u64
+            };
+            let options = Options {
+                gas: Some(gas_limit.into()),
+                ..Default::default()
+            };
             let params = (token_info.address, amount, sync_address);
-            self.eth_client
-                .sign_call_tx("depositERC20", params, options)
+            let data = self.client().encode_tx_data("depositERC20", params);
+
+            self.client()
+                .sign_prepared_tx(data, options)
                 .await
                 .map_err(|_| ClientError::IncorrectCredentials)?
         };
 
         let transaction_hash = self
-            .eth_client
+            .client()
             .send_raw_tx(signed_tx.raw_tx)
             .await
             .map_err(|err| ClientError::NetworkError(err.to_string()))?;
@@ -304,14 +418,52 @@ impl<S: EthereumSigner> EthereumProvider<S> {
             .tokens_cache
             .resolve(token.clone())
             .ok_or(ClientError::UnknownToken)?;
-        let account_id = U256::from(account_id);
+        let account_id = U256::from(*account_id);
 
-        let mut options = Options::default();
-        options.gas = Some(500_000.into());
+        let options = Options {
+            gas: Some(500_000.into()),
+            ..Default::default()
+        };
 
+        let data = self
+            .client()
+            .encode_tx_data("requestFullExit", (account_id, token.address));
+        let signed_tx = self
+            .client()
+            .sign_prepared_tx(data, options)
+            .await
+            .map_err(|_| ClientError::IncorrectCredentials)?;
+
+        let transaction_hash = self
+            .client()
+            .send_raw_tx(signed_tx.raw_tx)
+            .await
+            .map_err(|err| ClientError::NetworkError(err.to_string()))?;
+
+        Ok(transaction_hash)
+    }
+
+    /// Performs a full exit for a certain nft.
+    pub async fn full_exit_nft(
+        &self,
+        token: TokenId,
+        account_id: AccountId,
+    ) -> Result<H256, ClientError> {
+        if token.0 < MIN_NFT_TOKEN_ID {
+            return Err(ClientError::UnknownToken);
+        }
+        let account_id = U256::from(*account_id);
+        let options = Options {
+            gas: Some(500_000.into()),
+            ..Default::default()
+        };
+
+        let data = self
+            .eth_client
+            .encode_tx_data("requestFullExitNFT", (account_id, token.0));
         let signed_tx = self
             .eth_client
-            .sign_call_tx("fullExit", (account_id, token.address), options)
+            .sign_prepared_tx(data, options)
             .await
             .map_err(|_| ClientError::IncorrectCredentials)?;
 
@@ -325,19 +477,25 @@ impl<S: EthereumSigner> EthereumProvider<S> {
     }
 
     /// Sets the timeout to wait for transactions to appear in the Ethereum network.
-    /// By default it is set to 10 seconds.
+    /// By default it is set to 30 seconds.
     pub fn set_confirmation_timeout(&mut self, timeout: Duration) {
         self.confirmation_timeout = timeout;
     }
 
+    /// Sets the time to poll for transactions to appear in the Ethereum network.
+    /// By default it is set to 1 second.
+    pub fn set_poll_time(&mut self, time: Duration) {
+        self.poll_time = time;
+    }
+
     /// Waits until the transaction is confirmed by the Ethereum blockchain.
     pub async fn wait_for_tx(&self, tx_hash: H256) -> Result<TransactionReceipt, ClientError> {
-        let mut poller = tokio::time::interval(Duration::from_millis(100));
+        let mut poller = tokio::time::interval(self.poll_time);
 
         let start = Instant::now();
         loop {
             if let Some(receipt) = self
-                .eth_client
+                .client()
                 .tx_receipt(tx_hash)
                 .await
                 .map_err(|err| ClientError::NetworkError(err.to_string()))?
@@ -355,8 +513,14 @@ impl<S: EthereumSigner> EthereumProvider<S> {
 
 /// Trait describes the ability to receive the priority operation from this holder.
 pub trait PriorityOpHolder {
-    /// Returns the priority operation if exist.
+    /// Returns the priority operation if exists.
     fn priority_op(&self) -> Option<PriorityOp>;
+
+    /// Returns the handle for the priority operation.
+    fn priority_op_handle<P: Provider>(&self, provider: P) -> Option<PriorityOpHandle<P>> {
+        self.priority_op()
+            .map(|op| PriorityOpHandle::new(PriorityOpId(op.serial_id), provider))
+    }
 }
 
 impl PriorityOpHolder for TransactionReceipt {

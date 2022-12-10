@@ -12,7 +12,7 @@ pub struct BlocksCommitOperation {
 
 pub fn stored_block_info(block: &Block) -> Token {
     Token::Tuple(vec![
-        Token::Uint(U256::from(block.block_number)),
+        Token::Uint(U256::from(*block.block_number)),
         Token::Uint(U256::from(block.number_of_processed_prior_ops())),
         Token::FixedBytes(
             block
@@ -40,18 +40,18 @@ impl BlocksCommitOperation {
                     .into_iter()
                     .map(|op| {
                         Token::Tuple(vec![
-                            Token::Uint(U256::from(op.public_data_offset)),
                             Token::Bytes(op.eth_witness),
+                            Token::Uint(U256::from(op.public_data_offset)),
                         ])
                     })
                     .collect::<Vec<_>>();
                 Token::Tuple(vec![
-                    Token::Uint(U256::from(block.block_number)),
-                    Token::Uint(U256::from(block.fee_account)),
                     Token::FixedBytes(block.get_eth_encoded_root().as_bytes().to_vec()),
                     Token::Bytes(block.get_eth_public_data()),
                     Token::Uint(U256::from(block.timestamp)),
                     Token::Array(onchain_ops),
+                    Token::Uint(U256::from(*block.block_number)),
+                    Token::Uint(U256::from(*block.fee_account)),
                 ])
             })
             .collect();
@@ -82,7 +82,7 @@ pub struct BlocksProofOperation {
 
 impl BlocksProofOperation {
     pub fn get_eth_tx_args(&self) -> Vec<Token> {
-        let blocks_arg = Token::Array(self.blocks.iter().map(|b| stored_block_info(b)).collect());
+        let blocks_arg = Token::Array(self.blocks.iter().map(stored_block_info).collect());
 
         let proof = self.proof.get_eth_tx_args();
 
@@ -105,13 +105,13 @@ pub struct BlocksExecuteOperation {
 
 impl BlocksExecuteOperation {
     fn get_eth_tx_args_for_block(block: &Block) -> Token {
-        let stored_block = stored_block_info(&block);
+        let stored_block = stored_block_info(block);
 
         let processable_ops_pubdata = Token::Array(
             block
                 .processable_ops_pubdata()
                 .into_iter()
-                .map(|pubdata| Token::Bytes(pubdata))
+                .map(Token::Bytes)
                 .collect(),
         );
 
@@ -119,12 +119,17 @@ impl BlocksExecuteOperation {
     }
 
     pub fn get_eth_tx_args(&self) -> Vec<Token> {
-        vec![Token::Array(
-            self.blocks
-                .iter()
-                .map(BlocksExecuteOperation::get_eth_tx_args_for_block)
-                .collect(),
-        )]
+        // Does not make automatic withdrawals in execute operation
+        let complete_withdrawals = Token::Bool(false);
+        vec![
+            Token::Array(
+                self.blocks
+                    .iter()
+                    .map(BlocksExecuteOperation::get_eth_tx_args_for_block)
+                    .collect(),
+            ),
+            complete_withdrawals,
+        ]
     }
 
     pub fn block_range(&self) -> (BlockNumber, BlockNumber) {
@@ -202,6 +207,28 @@ impl AggregatedOperation {
             AggregatedOperation::PublishProofBlocksOnchain(op) => op.block_range(),
             AggregatedOperation::ExecuteBlocks(op) => op.block_range(),
         }
+    }
+
+    pub fn is_commit(&self) -> bool {
+        matches!(self.get_action_type(), AggregatedActionType::CommitBlocks)
+    }
+
+    pub fn is_execute(&self) -> bool {
+        matches!(self.get_action_type(), AggregatedActionType::ExecuteBlocks)
+    }
+
+    pub fn is_create_proof(&self) -> bool {
+        matches!(
+            self.get_action_type(),
+            AggregatedActionType::CreateProofBlocks
+        )
+    }
+
+    pub fn is_publish_proofs(&self) -> bool {
+        matches!(
+            self.get_action_type(),
+            AggregatedActionType::PublishProofBlocksOnchain
+        )
     }
 }
 

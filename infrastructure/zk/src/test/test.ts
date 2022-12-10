@@ -1,6 +1,5 @@
 import { Command } from 'commander';
 import * as utils from '../utils';
-import * as contract from '../contract';
 
 import * as integration from './integration';
 export { integration };
@@ -22,59 +21,82 @@ async function runOnTestDb(reset: boolean, dir: string, command: string) {
 }
 
 export async function db(reset: boolean, ...args: string[]) {
+    // Running many similar transactions in parallel can cause db deadlocks, so we run
+    // them in a single thread. Given that tests are pretty fast, it's not a big problem.
     await runOnTestDb(
         reset,
         'core/lib/storage',
-        `cargo test --release -p zksync_storage --features db_test -- --nocapture
+        `cargo test --release -p zksync_storage --lib -- --ignored --nocapture --test-threads=1
         ${args.join(' ')}`
     );
 }
 
 export async function rustApi(reset: boolean, ...args: string[]) {
+    // Running many similar transactions in parallel can cause db deadlocks, so we run
+    // them in a single thread. Given that tests are pretty fast, it's not a big problem.
     await runOnTestDb(
         reset,
         'core/bin/zksync_api',
-        `cargo test --release -p zksync_api --features api_test -- --nocapture
+        `cargo test --release -p zksync_api --lib -- --ignored --nocapture --test-threads=1 api_server
         ${args.join(' ')}`
     );
 }
 
 export async function contracts() {
-    await contract.build();
-    await utils.spawn('yarn contracts unit-test');
+    await utils.spawn('yarn contracts test');
 }
 
 export async function circuit(threads: number = 1, testName?: string, ...args: string[]) {
     await utils.spawn(
-        `cargo test --no-fail-fast --release -p zksync_circuit ${testName || ''} 
+        `cargo test --no-fail-fast --release -p zksync_circuit ${testName || ''}
          -- --ignored --test-threads ${threads} ${args.join(' ')}`
     );
 }
 
 export async function prover() {
-    await utils.spawn('cargo test -p zksync_prover --release -- --ignored');
+    await utils.spawn('cargo test -p zksync_prover --release');
+}
+
+export async function witness_generator() {
+    await utils.spawn('cargo test -p zksync_witness_generator --release');
 }
 
 export async function js() {
     await utils.spawn('yarn zksync tests');
-    await utils.spawn('yarn fee-seller tests');
 }
 
-export async function rust() {
+async function rustCryptoTests() {
+    process.chdir('sdk/zksync-crypto');
+    await utils.spawn('cargo test --release');
+    process.chdir(process.env.ZKSYNC_HOME as string);
+}
+
+export async function serverRust() {
     await utils.spawn('cargo test --release');
     await db(true);
     await rustApi(true);
     await prover();
-    const { stdout: threads } = await utils.exec('nproc');
-    await circuit(parseInt(threads));
+}
+
+export async function cryptoRust() {
+    await circuit(25);
+    await rustCryptoTests();
+}
+
+export async function rust() {
+    await serverRust();
+    await cryptoRust();
 }
 
 export const command = new Command('test').description('run test suites').addCommand(integration.command);
 
 command.command('js').description('run unit-tests for javascript packages').action(js);
 command.command('prover').description('run unit-tests for the prover').action(prover);
+command.command('witness-generator').description('run unit-tests for the witness-generator').action(witness_generator);
 command.command('contracts').description('run unit-tests for the contracts').action(contracts);
 command.command('rust').description('run unit-tests for all rust binaries and libraries').action(rust);
+command.command('server-rust').description('run unit-tests for server binaries and libraries').action(serverRust);
+command.command('crypto-rust').description('run unit-tests for rust crypto binaries and libraries').action(cryptoRust);
 
 command
     .command('db')

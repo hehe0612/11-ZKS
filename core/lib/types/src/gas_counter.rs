@@ -2,11 +2,13 @@
 //! the transactions that server sends to the Ethereum network.
 //! Server uses this module to ensure that generated transactions
 //! won't run out of the gas and won't trespass the block gas limit.
-
 // Workspace deps
-use zksync_basic_types::U256;
+use zksync_basic_types::*;
 // Local deps
-use crate::{config::MAX_WITHDRAWALS_TO_COMPLETE_IN_A_CALL, ZkSyncOp};
+use crate::{Block, ZkSyncOp};
+
+// HACK: hardcode some configuration options for now.
+const MAX_WITHDRAWALS_TO_COMPLETE_IN_A_CALL: u64 = 20;
 
 /// Amount of gas that we can afford to spend in one transaction.
 /// This value must be big enough to fit big blocks with expensive transactions,
@@ -23,39 +25,58 @@ impl CommitCost {
     // These values are estimated using the `gas_price_test` in `testkit`.
 
     // TODO: overvalued for quick fix of tx fails (ZKS-109).
-    pub const BASE_COST: u64 = 300_000;
-    pub const DEPOSIT_COST: u64 = 10_397;
-    pub const CHANGE_PUBKEY_COST_OFFCHAIN: u64 = 15_866;
-    pub const CHANGE_PUBKEY_COST_ONCHAIN: u64 = 3_929;
-    pub const TRANSFER_COST: u64 = 334;
-    pub const TRANSFER_TO_NEW_COST: u64 = 862;
-    pub const FULL_EXIT_COST: u64 = 10_165;
-    pub const WITHDRAW_COST: u64 = 2_167;
+    pub const BASE_COST: u64 = 51_000;
+    pub const DEPOSIT_COST: u64 = 7_700;
+    // TODO: estimate after changepubkey gas cost estimation is fixed [ZKS-554]
+    pub const OLD_CHANGE_PUBKEY_COST_OFFCHAIN: u64 = 25_000;
+    pub const CHANGE_PUBKEY_COST_OFFCHAIN: u64 = 12_700;
+    pub const CHANGE_PUBKEY_COST_ONCHAIN: u64 = 6_400;
+    pub const CHANGE_PUBKEY_COST_CREATE2: u64 = 8_450;
+    pub const TRANSFER_COST: u64 = 300;
+    pub const TRANSFER_TO_NEW_COST: u64 = 940;
+    pub const FULL_EXIT_COST: u64 = 10_000;
+    pub const WITHDRAW_COST: u64 = 3_900;
+    pub const WITHDRAW_NFT_COST: u64 = 5_150;
     pub const FORCED_EXIT_COST: u64 = Self::WITHDRAW_COST; // TODO: Verify value (ZKS-109).
+    pub const MINT_TOKEN_COST: u64 = 920;
+    pub const SWAP_COST: u64 = 710;
 
     pub fn base_cost() -> U256 {
         U256::from(Self::BASE_COST)
     }
 
     pub fn op_cost(op: &ZkSyncOp) -> U256 {
-        // let x = ChangePubKeyEthAuthDa;
         let cost = match op {
             ZkSyncOp::Noop(_) => 0,
             ZkSyncOp::Deposit(_) => Self::DEPOSIT_COST,
-            ZkSyncOp::ChangePubKeyOffchain(change_pubkey) => {
-                // TODO: determine correct cost of this tx
-                if change_pubkey.tx.eth_auth_data.is_ecdsa() {
-                    Self::CHANGE_PUBKEY_COST_OFFCHAIN
-                } else {
-                    Self::CHANGE_PUBKEY_COST_ONCHAIN
-                }
+            ZkSyncOp::ChangePubKeyOffchain(_change_pubkey) => {
+                Self::OLD_CHANGE_PUBKEY_COST_OFFCHAIN
+                // TODO: Restore when we figure out why this failed [ZKS-554]
+                // match change_pubkey.tx.get_change_pubkey_fee_type() {
+                //     ChangePubKeyFeeTypeArg::ContractsV4Version(ChangePubKeyType::ECDSA) => {
+                //         Self::CHANGE_PUBKEY_COST_OFFCHAIN
+                //     }
+                //     ChangePubKeyFeeTypeArg::ContractsV4Version(ChangePubKeyType::Onchain)
+                //     | ChangePubKeyFeeTypeArg::PreContracts4Version {
+                //         onchain_pubkey_auth: true,
+                //     } => Self::CHANGE_PUBKEY_COST_ONCHAIN,
+                //     ChangePubKeyFeeTypeArg::ContractsV4Version(ChangePubKeyType::CREATE2) => {
+                //         Self::CHANGE_PUBKEY_COST_CREATE2
+                //     }
+                //     ChangePubKeyFeeTypeArg::PreContracts4Version {
+                //         onchain_pubkey_auth: false,
+                //     } => Self::OLD_CHANGE_PUBKEY_COST_OFFCHAIN,
+                // }
             }
             ZkSyncOp::Transfer(_) => Self::TRANSFER_COST,
             ZkSyncOp::TransferToNew(_) => Self::TRANSFER_TO_NEW_COST,
             ZkSyncOp::FullExit(_) => Self::FULL_EXIT_COST,
             ZkSyncOp::Withdraw(_) => Self::WITHDRAW_COST,
             ZkSyncOp::ForcedExit(_) => Self::FORCED_EXIT_COST,
+            ZkSyncOp::Swap(_) => Self::SWAP_COST,
+            ZkSyncOp::MintNFTOp(_) => Self::MINT_TOKEN_COST,
             ZkSyncOp::Close(_) => unreachable!("Close operations are disabled"),
+            ZkSyncOp::WithdrawNFT(_) => Self::WITHDRAW_NFT_COST,
         };
 
         U256::from(cost)
@@ -71,15 +92,19 @@ impl VerifyCost {
     //
     // These values are estimated using the `gas_price_test` in `testkit`.
 
-    // TODO: overvalued for quick fix of tx fails (ZKS-109).
-    pub const BASE_COST: u64 = 1_000_000;
-    pub const DEPOSIT_COST: u64 = 0;
+    pub const BASE_COST: u64 = 10_000;
+    pub const DEPOSIT_COST: u64 = 100;
     pub const CHANGE_PUBKEY_COST: u64 = 0;
     pub const TRANSFER_COST: u64 = 0;
     pub const TRANSFER_TO_NEW_COST: u64 = 0;
-    pub const FULL_EXIT_COST: u64 = 2_499;
-    pub const WITHDRAW_COST: u64 = 45_668;
-    pub const FORCED_EXIT_COST: u64 = Self::WITHDRAW_COST; // TODO: Verify value (ZKS-109).
+    pub const SWAP_COST: u64 = 0;
+    pub const FULL_EXIT_COST: u64 = 30_000;
+    pub const WITHDRAW_COST: u64 = 30_000;
+    pub const PENDING_WITHDRAW_COST: u64 = 60_000;
+    pub const FORCED_EXIT_COST: u64 = Self::WITHDRAW_COST;
+    pub const MINT_NFT_COST: u64 = 0;
+    pub const WITHDRAW_NFT_COST: u64 = 80_000;
+    pub const PENDING_WITHDRAW_NFT_COST: u64 = 240_000;
 
     pub fn base_cost() -> U256 {
         U256::from(Self::BASE_COST)
@@ -95,7 +120,10 @@ impl VerifyCost {
             ZkSyncOp::FullExit(_) => Self::FULL_EXIT_COST,
             ZkSyncOp::Withdraw(_) => Self::WITHDRAW_COST,
             ZkSyncOp::ForcedExit(_) => Self::FORCED_EXIT_COST,
+            ZkSyncOp::MintNFTOp(_) => Self::MINT_NFT_COST,
+            ZkSyncOp::Swap(_) => Self::SWAP_COST,
             ZkSyncOp::Close(_) => unreachable!("Close operations are disabled"),
+            ZkSyncOp::WithdrawNFT(_) => Self::WITHDRAW_NFT_COST,
         };
 
         U256::from(cost)
@@ -128,11 +156,29 @@ impl Default for GasCounter {
     }
 }
 
+#[derive(Debug)]
+pub struct WrongTransaction;
+
+impl std::fmt::Display for WrongTransaction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Wrong transaction in gas counter")
+    }
+}
+
+impl std::error::Error for WrongTransaction {}
+
 impl GasCounter {
     /// Base cost of `completeWithdrawals` contract method call.
     pub const COMPLETE_WITHDRAWALS_BASE_COST: u64 = 30_307;
     /// Cost of processing one withdraw operation in `completeWithdrawals` contract call.
     pub const COMPLETE_WITHDRAWALS_COST: u64 = 41_641;
+    /// Some ERС20 tokens may require a lot of gas to withdrawals.
+    pub const COMPLETE_WITHDRAWALS_ERC20_COST: u64 = 200_000;
+
+    /// constants for gas limit calculation of aggregated operations
+    pub const BASE_COMMIT_BLOCKS_TX_COST: usize = 450_000;
+    pub const BASE_EXECUTE_BLOCKS_TX_COST: usize = 450_000;
+    pub const BASE_PROOF_BLOCKS_TX_COST: usize = 1_500_000;
 
     pub fn new() -> Self {
         Self::default()
@@ -142,15 +188,15 @@ impl GasCounter {
     ///
     /// Returns `Ok(())` if transaction fits, and returns `Err(())` if
     /// the block must be sealed without this transaction.
-    pub fn add_op(&mut self, op: &ZkSyncOp) -> Result<(), ()> {
+    pub fn add_op(&mut self, op: &ZkSyncOp) -> Result<(), WrongTransaction> {
         let new_commit_cost = self.commit_cost + CommitCost::op_cost(op);
         if Self::scale_up(new_commit_cost) > U256::from(TX_GAS_LIMIT) {
-            return Err(());
+            return Err(WrongTransaction);
         }
 
         let new_verify_cost = self.verify_cost + VerifyCost::op_cost(op);
         if Self::scale_up(new_verify_cost) > U256::from(TX_GAS_LIMIT) {
-            return Err(());
+            return Err(WrongTransaction);
         }
 
         self.commit_cost = new_commit_cost;
@@ -159,12 +205,38 @@ impl GasCounter {
         Ok(())
     }
 
+    pub fn can_include(&self, ops: &[ZkSyncOp]) -> bool {
+        let ops_cost: (U256, U256) = ops
+            .iter()
+            .map(|op| (CommitCost::op_cost(op), VerifyCost::op_cost(op)))
+            .fold((U256::zero(), U256::zero()), |mut sum, val| {
+                sum.0 += val.0;
+                sum.1 += val.1;
+                sum
+            });
+        let new_commit_cost = self.commit_cost + ops_cost.0;
+        let new_verify_cost = self.verify_cost + ops_cost.1;
+
+        if Self::scale_up(new_commit_cost) > U256::from(TX_GAS_LIMIT) {
+            return false;
+        }
+        if Self::scale_up(new_verify_cost) > U256::from(TX_GAS_LIMIT) {
+            return false;
+        }
+
+        true
+    }
+
+    pub fn batch_fits_into_empty_block(ops: &[ZkSyncOp]) -> bool {
+        Self::new().can_include(ops)
+    }
+
     pub fn commit_gas_limit(&self) -> U256 {
-        self.commit_cost * U256::from(130) / U256::from(100)
+        Self::scale_up(self.commit_cost)
     }
 
     pub fn verify_gas_limit(&self) -> U256 {
-        self.verify_cost * U256::from(130) / U256::from(100)
+        Self::scale_up(self.verify_cost)
     }
 
     pub fn complete_withdrawals_gas_limit() -> U256 {
@@ -172,9 +244,27 @@ impl GasCounter {
         // is predictable.
         let approx_limit = U256::from(Self::COMPLETE_WITHDRAWALS_BASE_COST)
             + U256::from(MAX_WITHDRAWALS_TO_COMPLETE_IN_A_CALL)
-                * U256::from(Self::COMPLETE_WITHDRAWALS_COST);
+                * U256::from(Self::COMPLETE_WITHDRAWALS_ERC20_COST);
 
         // We scale this value up nevertheless, just in case.
+        Self::scale_up(approx_limit)
+    }
+
+    pub fn commit_gas_limit_aggregated(blocks: &[Block]) -> U256 {
+        let approx_limit = U256::from(Self::BASE_COMMIT_BLOCKS_TX_COST)
+            + blocks
+                .iter()
+                .fold(U256::zero(), |acc, block| acc + block.commit_gas_limit);
+
+        Self::scale_up(approx_limit)
+    }
+
+    pub fn execute_gas_limit_aggregated(blocks: &[Block]) -> U256 {
+        let approx_limit = U256::from(Self::BASE_EXECUTE_BLOCKS_TX_COST)
+            + blocks
+                .iter()
+                .fold(U256::zero(), |acc, block| acc + block.verify_gas_limit);
+
         Self::scale_up(approx_limit)
     }
 
@@ -187,60 +277,216 @@ impl GasCounter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{operations::ChangePubKeyOp, tx::ChangePubKey};
+    use crate::{
+        operations::{
+            ChangePubKeyOp, DepositOp, ForcedExitOp, FullExitOp, NoopOp, TransferOp,
+            TransferToNewOp, WithdrawOp,
+        },
+        priority_ops::{Deposit, FullExit},
+        tx::{ChangePubKey, ForcedExit, Transfer, Withdraw},
+        MintNFT, MintNFTOp, WithdrawNFT, WithdrawNFTOp,
+    };
 
     #[test]
-    fn commit_cost() {
+    fn commit_and_verify_cost() {
         let change_pubkey_op = ChangePubKeyOp {
             tx: ChangePubKey::new(
-                1,
+                AccountId(1),
                 Default::default(),
                 Default::default(),
-                0,
+                TokenId(0),
+                Default::default(),
                 Default::default(),
                 Default::default(),
                 None,
                 None,
             ),
-            account_id: 1,
+            account_id: AccountId(1),
+        };
+        let deposit_op = DepositOp {
+            priority_op: Deposit {
+                from: Default::default(),
+                token: TokenId(0),
+                amount: Default::default(),
+                to: Default::default(),
+            },
+            account_id: AccountId(1),
+        };
+        let transfer_op = TransferOp {
+            tx: Transfer::new(
+                AccountId(1),
+                Default::default(),
+                Default::default(),
+                TokenId(0),
+                Default::default(),
+                Default::default(),
+                Nonce(0),
+                Default::default(),
+                None,
+            ),
+            from: AccountId(1),
+            to: AccountId(1),
+        };
+        let transfer_to_new_op = TransferToNewOp {
+            tx: Transfer::new(
+                AccountId(1),
+                Default::default(),
+                Default::default(),
+                TokenId(0),
+                Default::default(),
+                Default::default(),
+                Nonce(0),
+                Default::default(),
+                None,
+            ),
+            from: AccountId(1),
+            to: AccountId(1),
+        };
+        let noop_op = NoopOp {};
+        let full_exit_op = FullExitOp {
+            priority_op: FullExit {
+                account_id: AccountId(0),
+                eth_address: Default::default(),
+                token: TokenId(0),
+                is_legacy: false,
+            },
+            withdraw_amount: None,
+            creator_account_id: None,
+            creator_address: None,
+            serial_id: None,
+            content_hash: None,
+        };
+        let forced_exit_op = ForcedExitOp {
+            tx: ForcedExit::new(
+                AccountId(1),
+                Default::default(),
+                TokenId(0),
+                Default::default(),
+                Nonce(0),
+                Default::default(),
+                None,
+            ),
+            target_account_id: AccountId(1),
+            withdraw_amount: None,
+        };
+        let withdraw_op = WithdrawOp {
+            tx: Withdraw::new(
+                AccountId(1),
+                Default::default(),
+                Default::default(),
+                TokenId(0),
+                Default::default(),
+                Default::default(),
+                Nonce(0),
+                Default::default(),
+                None,
+            ),
+            account_id: AccountId(1),
         };
 
-        // TODO: add other operations to this test (ZKS-110).
+        let withdraw_nft_op = WithdrawNFTOp {
+            tx: WithdrawNFT::new(
+                AccountId(1),
+                Default::default(),
+                Default::default(),
+                TokenId(0),
+                Default::default(),
+                Default::default(),
+                Nonce(0),
+                Default::default(),
+                None,
+            ),
+            creator_id: Default::default(),
+            creator_address: Default::default(),
+            content_hash: Default::default(),
+            serial_id: 0,
+        };
 
-        let test_vector = vec![(
-            ZkSyncOp::from(change_pubkey_op),
-            CommitCost::CHANGE_PUBKEY_COST_ONCHAIN,
-        )];
+        let mint_nft_op = MintNFTOp {
+            tx: MintNFT::new(
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                Default::default(),
+                None,
+            ),
+            creator_account_id: Default::default(),
+            recipient_account_id: Default::default(),
+        };
+        let test_vector_commit = vec![
+            (
+                ZkSyncOp::from(change_pubkey_op.clone()),
+                CommitCost::OLD_CHANGE_PUBKEY_COST_OFFCHAIN, // restore after [ZKS-554]
+            ),
+            (ZkSyncOp::from(deposit_op.clone()), CommitCost::DEPOSIT_COST),
+            (
+                ZkSyncOp::from(transfer_op.clone()),
+                CommitCost::TRANSFER_COST,
+            ),
+            (
+                ZkSyncOp::from(transfer_to_new_op.clone()),
+                CommitCost::TRANSFER_TO_NEW_COST,
+            ),
+            (ZkSyncOp::from(noop_op.clone()), 0),
+            (
+                ZkSyncOp::from(full_exit_op.clone()),
+                CommitCost::FULL_EXIT_COST,
+            ),
+            (
+                ZkSyncOp::from(forced_exit_op.clone()),
+                CommitCost::FORCED_EXIT_COST,
+            ),
+            (
+                ZkSyncOp::from(withdraw_op.clone()),
+                CommitCost::WITHDRAW_COST,
+            ),
+            (
+                ZkSyncOp::from(withdraw_op.clone()),
+                CommitCost::WITHDRAW_COST,
+            ),
+            (
+                ZkSyncOp::from(withdraw_nft_op.clone()),
+                CommitCost::WITHDRAW_NFT_COST,
+            ),
+            (
+                ZkSyncOp::from(mint_nft_op.clone()),
+                CommitCost::MINT_TOKEN_COST,
+            ),
+        ];
+        let test_vector_verify = vec![
+            (
+                ZkSyncOp::from(change_pubkey_op),
+                VerifyCost::CHANGE_PUBKEY_COST,
+            ),
+            (ZkSyncOp::from(deposit_op), VerifyCost::DEPOSIT_COST),
+            (ZkSyncOp::from(transfer_op), VerifyCost::TRANSFER_COST),
+            (
+                ZkSyncOp::from(transfer_to_new_op),
+                VerifyCost::TRANSFER_TO_NEW_COST,
+            ),
+            (ZkSyncOp::from(noop_op), 0),
+            (ZkSyncOp::from(full_exit_op), VerifyCost::FULL_EXIT_COST),
+            (ZkSyncOp::from(forced_exit_op), VerifyCost::FORCED_EXIT_COST),
+            (ZkSyncOp::from(withdraw_op), VerifyCost::WITHDRAW_COST),
+            (
+                ZkSyncOp::from(withdraw_nft_op),
+                VerifyCost::WITHDRAW_NFT_COST,
+            ),
+            (ZkSyncOp::from(mint_nft_op), VerifyCost::MINT_NFT_COST),
+        ];
 
-        for (op, expected_cost) in test_vector {
-            assert_eq!(CommitCost::op_cost(&op), U256::from(expected_cost));
+        for (op, expected_cost) in test_vector_commit {
+            assert_eq!(
+                CommitCost::op_cost(&op),
+                U256::from(expected_cost),
+                "{:?}",
+                &op
+            );
         }
-    }
-
-    #[test]
-    fn verify_cost() {
-        let change_pubkey_op = ChangePubKeyOp {
-            tx: ChangePubKey::new(
-                1,
-                Default::default(),
-                Default::default(),
-                0,
-                Default::default(),
-                Default::default(),
-                None,
-                None,
-            ),
-            account_id: 1,
-        };
-
-        // TODO: add other operations to this test (ZKS-110).
-
-        let test_vector = vec![(
-            ZkSyncOp::from(change_pubkey_op),
-            VerifyCost::CHANGE_PUBKEY_COST,
-        )];
-
-        for (op, expected_cost) in test_vector {
+        for (op, expected_cost) in test_vector_verify {
             assert_eq!(VerifyCost::op_cost(&op), U256::from(expected_cost));
         }
     }
@@ -249,16 +495,17 @@ mod tests {
     fn gas_counter() {
         let change_pubkey_op = ChangePubKeyOp {
             tx: ChangePubKey::new(
-                1,
+                AccountId(1),
                 Default::default(),
                 Default::default(),
-                0,
+                TokenId(0),
+                Default::default(),
                 Default::default(),
                 Default::default(),
                 None,
                 None,
             ),
-            account_id: 1,
+            account_id: AccountId(1),
         };
         let zksync_op = ZkSyncOp::from(change_pubkey_op);
 
@@ -270,9 +517,19 @@ mod tests {
         // Verify cost is 0, thus amount of operations is determined by the commit cost.
         let amount_ops_in_block = (U256::from(TX_GAS_LIMIT)
             - GasCounter::scale_up(gas_counter.commit_cost))
-            / GasCounter::scale_up(U256::from(CommitCost::CHANGE_PUBKEY_COST_ONCHAIN));
+            / GasCounter::scale_up(U256::from(CommitCost::OLD_CHANGE_PUBKEY_COST_OFFCHAIN)); // restore after [ZKS-554]
 
+        let mut batch: Vec<_> = (0..amount_ops_in_block.as_u64())
+            .map(|_| zksync_op.clone())
+            .collect();
+        assert!(GasCounter::batch_fits_into_empty_block(&batch));
+
+        batch.push(zksync_op.clone());
+        assert!(!GasCounter::batch_fits_into_empty_block(&batch));
+
+        let slice = &[zksync_op.clone()];
         for _ in 0..amount_ops_in_block.as_u64() {
+            assert!(gas_counter.can_include(slice));
             gas_counter
                 .add_op(&zksync_op)
                 .expect("Gas limit was not reached, but op adding failed");
@@ -280,7 +537,7 @@ mod tests {
 
         // Expected gas limit is (base_cost + n_ops * op_cost) * 1.3
         let expected_commit_limit = (U256::from(CommitCost::BASE_COST)
-            + amount_ops_in_block * U256::from(CommitCost::CHANGE_PUBKEY_COST_ONCHAIN))
+            + amount_ops_in_block * U256::from(CommitCost::OLD_CHANGE_PUBKEY_COST_OFFCHAIN)) // restore after [ZKS-554]
             * U256::from(130)
             / U256::from(100);
         let expected_verify_limit = (U256::from(VerifyCost::BASE_COST)
@@ -289,6 +546,7 @@ mod tests {
             / U256::from(100);
         assert_eq!(gas_counter.commit_gas_limit(), expected_commit_limit);
         assert_eq!(gas_counter.verify_gas_limit(), expected_verify_limit);
+        assert!(!gas_counter.can_include(slice));
 
         // Attempt to add one more operation (it should fail).
         gas_counter

@@ -3,7 +3,7 @@ use criterion::{black_box, criterion_group, BatchSize, Bencher, Criterion, Throu
 // Local uses
 use zksync_crypto::circuit::account::CircuitAccount;
 use zksync_crypto::primitives::{BitConvert, BitIteratorLe, GetBits};
-use zksync_types::{Account, Address, PubKeyHash};
+use zksync_types::{Account, Address, Nonce, PubKeyHash, TokenId};
 
 /// Input size for byte slices (module-wide for calculating the throughput).
 const BYTE_SLICE_SIZE: usize = 512;
@@ -75,9 +75,9 @@ fn bench_circuit_account_transform(b: &mut Bencher<'_>) {
         let mut account = Account::default_with_address(&Address::from_slice(
             &hex::decode("0102030405060708091011121314151617181920").unwrap(),
         ));
-        account.set_balance(1, 1u32.into());
-        account.set_balance(2, 2u32.into());
-        account.nonce = 3;
+        account.set_balance(TokenId(1), 1u32.into());
+        account.set_balance(TokenId(2), 2u32.into());
+        account.nonce = Nonce(3);
         account.pub_key_hash =
             PubKeyHash::from_hex("sync:0102030405060708091011121314151617181920").unwrap();
         account
@@ -87,6 +87,55 @@ fn bench_circuit_account_transform(b: &mut Bencher<'_>) {
         setup,
         |account| {
             let _ = CircuitAccount::from(black_box(account));
+        },
+        BatchSize::SmallInput,
+    );
+}
+
+/// Measures time to execute `CircuitAccount::default()`.
+fn circuit_account_default(b: &mut Bencher<'_>) {
+    b.iter_with_large_drop(|| {
+        let _ = black_box(CircuitAccount::default());
+    });
+}
+
+/// Measures time to execute `CircuitAccount::default().get_bits_le()`.
+fn bench_circuit_account_get_bits_le_default(b: &mut Bencher<'_>) {
+    let circuit_account = CircuitAccount::default();
+    let setup = || circuit_account.clone();
+
+    b.iter_batched_ref(
+        setup,
+        |circuit_account| {
+            let _ = black_box(circuit_account.get_bits_le());
+        },
+        BatchSize::SmallInput,
+    );
+}
+
+/// `get_bits_le` is a method internally used by SMT to calculate the hash of the element.
+///
+/// `n_balances` parameter specifies the amount of elements in the balance tree.
+fn bench_circuit_account_get_bits_le(b: &mut Bencher<'_>, n_balances: usize) {
+    let mut account = Account::default_with_address(&Address::from_slice(
+        &hex::decode("0102030405060708091011121314151617181920").unwrap(),
+    ));
+
+    for i in (0..n_balances).map(|i| i as u32) {
+        account.set_balance(TokenId(i), i.into());
+    }
+    account.nonce = Nonce(3);
+    account.pub_key_hash =
+        PubKeyHash::from_hex("sync:0102030405060708091011121314151617181920").unwrap();
+
+    let circuit_account = CircuitAccount::from(account);
+
+    let setup = || circuit_account.clone();
+
+    b.iter_batched_ref(
+        setup,
+        |circuit_account| {
+            let _ = black_box(circuit_account.get_bits_le());
         },
         BatchSize::SmallInput,
     );
@@ -112,6 +161,17 @@ pub fn bench_primitives(c: &mut Criterion) {
         "bench_circuit_account_transform",
         bench_circuit_account_transform,
     );
+
+    c.bench_function("circuit_account_default", circuit_account_default);
+
+    let mut group = c.benchmark_group("bench_circuit_account_get_bits_le");
+    group.bench_function("default account", bench_circuit_account_get_bits_le_default);
+    for n_balances in [0, 10, 100, 1000] {
+        group.bench_function(&format!("n_balances: {}", n_balances), |b| {
+            bench_circuit_account_get_bits_le(b, n_balances)
+        });
+    }
+    group.finish();
 }
 
 criterion_group!(primitives_benches, bench_primitives);

@@ -6,45 +6,36 @@
   "workspaces": {
     "packages": [
       "sdk/zksync.js",
+      "sdk/zksync-crypto",
       "contracts",
-      "infrastructure/analytics",
-      "infrastructure/fee-seller",
-      "infrastructure/sdk-test-vector-generator",
-      "infrastructure/zcli",
-      "infrastructure/explorer",
       "infrastructure/zk",
+      "infrastructure/reading-tool",
+      "infrastructure/token-lists-manager",
+      "infrastructure/api-docs",
       "core/tests/ts-tests"
-    ],
-    "nohoist": [
-      "**/@vue/**",
-      "**/babel-eslint/**",
-      "**/eslint/**",
-      "**/eslint-plugin-vue/**",
-      "**/vue-template-compiler/**",
-      "**/bootstrap-vue/**",
-      "**/@vue",
-      "**/babel-eslint",
-      "**/eslint",
-      "**/eslint-plugin-vue",
-      "**/vue-template-compiler",
-      "**/bootstrap-vue"
     ]
   },
   "scripts": {
+    "build:zksync-sdk": "yarn zksync prepublish",
+    "build:crypto": "yarn crypto build",
+    "build:reading-tool": "yarn reading-tool build",
     "zksync": "yarn workspace zksync",
+    "crypto": "yarn workspace zksync-crypto",
     "contracts": "yarn workspace franklin-contracts",
-    "analytics": "yarn workspace analytics",
-    "fee-seller": "yarn workspace fee-seller",
-    "zcli": "yarn workspace zcli",
     "ts-tests": "yarn workspace ts-tests",
-    "explorer": "yarn workspace sync-explorer",
     "zk": "yarn workspace zk",
-    "lint:md": "markdownlint $(find . -name '*.md' -print -o -path '*/node_modules' -prune)",
-    "lint:sol": "solhint contracts/{,dev-}contracts{,/**}/*.sol"
+    "reading-tool": "yarn workspace reading-tool",
+    "api-docs": "yarn workspace api-docs"
   },
   "devDependencies": {
+    "@typescript-eslint/eslint-plugin": "^4.10.0",
+    "@typescript-eslint/parser": "^4.10.0",
+    "babel-eslint": "^10.1.0",
+    "eslint": "^7.16.0",
+    "eslint-config-alloy": "^3.8.2",
+    "markdown-toc": "^1.2.0",
     "markdownlint-cli": "^0.24.0",
-    "prettier": "^2.1.2",
+    "prettier": "^2.2.1",
     "prettier-plugin-solidity": "^1.0.0-alpha.60",
     "solhint": "^3.3.2"
   }

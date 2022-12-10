@@ -1,8 +1,3 @@
-//! Module encapsulating the database interaction.
-//! The essential part of this module is the trait that abstracts
-//! the database interaction, so `ETHSender` won't require an actual
-//! database to run, which is required for tests.
-
 // Built-in deps
 use std::collections::VecDeque;
 use std::str::FromStr;
@@ -11,13 +6,11 @@ use num::BigUint;
 use zksync_basic_types::{H256, U256};
 // Workspace uses
 use zksync_storage::{ConnectionPool, StorageProcessor};
-use zksync_types::{
-    ethereum::{ETHOperation, EthOpId, InsertedOperationResponse, OperationType},
-    Action, ActionType, Operation,
-};
+use zksync_types::ethereum::{ETHOperation, EthOpId, InsertedOperationResponse};
 // Local uses
 use super::transactions::ETHStats;
 use zksync_types::aggregated_operations::{AggregatedActionType, AggregatedOperation};
+use zksync_types::block::Block;
 
 /// Abstract database access trait, optimized for the needs of `ETHSender`.
 #[async_trait::async_trait]
@@ -28,10 +21,17 @@ pub(super) trait DatabaseInterface {
     /// Loads the unconfirmed and unprocessed operations from the database.
     /// Unconfirmed operations are Ethereum operations that were started, but not confirmed yet.
     /// Unprocessed operations are zkSync operations that were not started at all.
-    async fn restore_state(
+    async fn load_unconfirmed_operations(
         &self,
         connection: &mut StorageProcessor<'_>,
-    ) -> anyhow::Result<(VecDeque<ETHOperation>, Vec<(i64, AggregatedOperation)>)>;
+    ) -> anyhow::Result<VecDeque<ETHOperation>>;
+
+    /// Load all the aggregated operations that have no confirmation yet and have not yet been sent to Ethereum.
+    /// Should be used after server restart only.
+    async fn restore_unprocessed_operations(
+        &self,
+        connection: &mut StorageProcessor<'_>,
+    ) -> anyhow::Result<()>;
 
     /// Loads the unprocessed operations from the database.
     /// Unprocessed operations are zkSync operations that were not started at all.
@@ -39,6 +39,13 @@ pub(super) trait DatabaseInterface {
         &self,
         connection: &mut StorageProcessor<'_>,
     ) -> anyhow::Result<Vec<(i64, AggregatedOperation)>>;
+
+    /// Remove the unprocessed operations from the database.
+    async fn remove_unprocessed_operations(
+        &self,
+        connection: &mut StorageProcessor<'_>,
+        operations_id: Vec<i64>,
+    ) -> anyhow::Result<()>;
 
     /// Saves a new unconfirmed operation to the database.
     async fn save_new_eth_tx(
@@ -122,19 +129,28 @@ impl DatabaseInterface for Database {
         Ok(connection)
     }
 
-    async fn restore_state(
+    async fn load_unconfirmed_operations(
         &self,
         connection: &mut StorageProcessor<'_>,
-    ) -> anyhow::Result<(VecDeque<ETHOperation>, Vec<(i64, AggregatedOperation)>)> {
+    ) -> anyhow::Result<VecDeque<ETHOperation>> {
         let unconfirmed_ops = connection
             .ethereum_schema()
             .load_unconfirmed_operations()
             .await?;
-        let unprocessed_ops = connection
+
+        Ok(unconfirmed_ops)
+    }
+
+    async fn restore_unprocessed_operations(
+        &self,
+        connection: &mut StorageProcessor<'_>,
+    ) -> anyhow::Result<()> {
+        connection
             .ethereum_schema()
-            .load_unprocessed_operations()
+            .restore_unprocessed_operations()
             .await?;
-        Ok((unconfirmed_ops, unprocessed_ops))
+
+        Ok(())
     }
 
     async fn load_new_operations(
@@ -146,6 +162,19 @@ impl DatabaseInterface for Database {
             .load_unprocessed_operations()
             .await?;
         Ok(unprocessed_ops)
+    }
+
+    async fn remove_unprocessed_operations(
+        &self,
+        connection: &mut StorageProcessor<'_>,
+        operations_id: Vec<i64>,
+    ) -> anyhow::Result<()> {
+        connection
+            .ethereum_schema()
+            .remove_unprocessed_operations(operations_id)
+            .await?;
+
+        Ok(())
     }
 
     async fn save_new_eth_tx(
@@ -161,7 +190,7 @@ impl DatabaseInterface for Database {
             .ethereum_schema()
             .save_new_eth_tx(
                 op_type,
-                op.map(|(op_id, _)| op_id),
+                op,
                 deadline_block,
                 BigUint::from_str(&used_gas_price.to_string()).unwrap(),
                 raw_tx,
@@ -202,20 +231,24 @@ impl DatabaseInterface for Database {
 
     async fn is_previous_operation_confirmed(
         &self,
-        _connection: &mut StorageProcessor<'_>,
-        _op: &ETHOperation,
+        connection: &mut StorageProcessor<'_>,
+        op: &ETHOperation,
     ) -> anyhow::Result<bool> {
-        // TODO
-        Ok(true)
-        // let previous_op = op.id - 1;
-        // if previous_op < 0 {
-        //     return Ok(true);
-        // }
-        //
-        // Ok(connection
-        //     .ethereum_schema()
-        //     .is_aggregated_op_confirmed(previous_op)
-        //     .await?)
+        // If the ID of the current operation is 1, then this is the first transaction
+        // and it is not needed for checking confirmation.
+        if op.id == 1 {
+            return Ok(true);
+        }
+
+        // Since the operations are sent to the Ethereum one by one,
+        // we simply consider the operation with ID less by one.
+        let previous_op = op.id - 1;
+        let confirmed = connection
+            .ethereum_schema()
+            .is_aggregated_op_confirmed(previous_op)
+            .await?;
+
+        Ok(confirmed)
     }
 
     async fn confirm_operation(
@@ -229,37 +262,51 @@ impl DatabaseInterface for Database {
         match &op.op {
             Some((_, AggregatedOperation::CommitBlocks(op))) => {
                 let (first_block, last_block) = op.block_range();
+
+                self.set_metrics(&op.blocks, "L1_commit".to_string()).await;
                 transaction
                     .chain()
                     .operations_schema()
-                    .confirm_operations(first_block, last_block, ActionType::COMMIT)
+                    .confirm_aggregated_operations(
+                        first_block,
+                        last_block,
+                        AggregatedActionType::CommitBlocks,
+                    )
+                    .await?;
+            }
+            Some((_, AggregatedOperation::PublishProofBlocksOnchain(op))) => {
+                let (first_block, last_block) = op.block_range();
+                self.set_metrics(&op.blocks, "L1_publish_proof".to_string())
+                    .await;
+                transaction
+                    .chain()
+                    .operations_schema()
+                    .confirm_aggregated_operations(
+                        first_block,
+                        last_block,
+                        AggregatedActionType::PublishProofBlocksOnchain,
+                    )
                     .await?;
             }
             Some((_, AggregatedOperation::ExecuteBlocks(op))) => {
                 let (first_block, last_block) = op.block_range();
+                self.set_metrics(&op.blocks, "L1_execute".to_string()).await;
                 for block in &op.blocks {
                     transaction
                         .chain()
                         .state_schema()
                         .apply_state_update(block.block_number)
                         .await?;
-                    transaction
-                        .chain()
-                        .block_schema()
-                        .execute_operation(Operation {
-                            id: None,
-                            action: Action::Verify {
-                                proof: Default::default(),
-                            },
-                            block: block.clone(),
-                        })
-                        .await?;
                 }
 
                 transaction
                     .chain()
                     .operations_schema()
-                    .confirm_operations(first_block, last_block, ActionType::VERIFY)
+                    .confirm_aggregated_operations(
+                        first_block,
+                        last_block,
+                        AggregatedActionType::ExecuteBlocks,
+                    )
                     .await?;
             }
             _ => {}
@@ -295,5 +342,23 @@ impl DatabaseInterface for Database {
             .update_gas_price(gas_price_limit, average_gas_price)
             .await?;
         Ok(())
+    }
+}
+
+impl Database {
+    async fn set_metrics(&self, blocks: &[Block], stage: String) {
+        for block in blocks {
+            for tx in &block.block_transactions {
+                let labels = vec![
+                    ("stage", stage.clone()),
+                    ("name", tx.variance_name()),
+                    ("token", tx.token_id().to_string()),
+                ];
+
+                metrics::histogram!("process_tx", tx.elapsed(), &labels);
+            }
+            let labels = vec![("stage", stage.clone())];
+            metrics::histogram!("process_block", block.elapsed(), &labels)
+        }
     }
 }

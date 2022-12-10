@@ -12,17 +12,18 @@ use zksync_types::{
     account::{Account, PubKeyHash},
     priority_ops::{Deposit, FullExit},
     tx::{ChangePubKey, PackedEthSignature, Transfer, Withdraw},
-    AccountId, AccountMap, Address, BlockNumber, TokenId, ZkSyncPriorityOp, ZkSyncTx,
+    AccountId, AccountMap, Address, Nonce, TokenId, ZkSyncPriorityOp, ZkSyncTx,
 };
 // Local uses
 use zksync_state::state::ZkSyncState;
 use zksync_types::tx::{ChangePubKeyECDSAData, ChangePubKeyEthAuthData};
 
-const ETH_TOKEN_ID: TokenId = 0x00;
+const ETH_TOKEN_ID: TokenId = TokenId(0x00);
 // The amount is not important, since we always work with 1 account.
 // We use some small non-zero value, so the overhead for cloning will not be big.
-const ACCOUNTS_AMOUNT: AccountId = 10;
-const CURRENT_BLOCK: BlockNumber = 1_000;
+const ACCOUNTS_AMOUNT: AccountId = AccountId(10);
+
+const DEFAULT_TIMESTAMP: u64 = 0;
 
 /// Creates a random ZKSync account.
 fn generate_account() -> (H256, PrivateKey, Account) {
@@ -35,9 +36,8 @@ fn generate_account() -> (H256, PrivateKey, Account) {
     let address = PackedEthSignature::address_from_private_key(&eth_sk)
         .expect("Can't get address from the ETH secret key");
 
-    let mut account = Account::default();
+    let mut account = Account::default_with_address(&address);
     account.pub_key_hash = PubKeyHash::from_privkey(&sk);
-    account.address = address;
     account.set_balance(ETH_TOKEN_ID, default_balance);
 
     (eth_sk, sk, account)
@@ -48,14 +48,14 @@ fn generate_state() -> (HashMap<AccountId, (PrivateKey, H256)>, ZkSyncState) {
     let mut accounts = AccountMap::default();
     let mut keys = HashMap::new();
 
-    for account_id in 0..ACCOUNTS_AMOUNT {
+    for account_id in 0..*ACCOUNTS_AMOUNT {
         let (eth_sk, sk, new_account) = generate_account();
 
-        accounts.insert(account_id, new_account);
-        keys.insert(account_id, (sk, eth_sk));
+        accounts.insert(AccountId(account_id), new_account);
+        keys.insert(AccountId(account_id), (sk, eth_sk));
     }
 
-    let state = ZkSyncState::from_acc_map(accounts, CURRENT_BLOCK);
+    let state = ZkSyncState::from_acc_map(accounts);
 
     (keys, state)
 }
@@ -63,30 +63,33 @@ fn generate_state() -> (HashMap<AccountId, (PrivateKey, H256)>, ZkSyncState) {
 /// Bench for `ZkSyncState::apply_transfer_to_new_op`.
 fn apply_transfer_to_new_op(b: &mut Bencher<'_>) {
     let (keys, state) = generate_state();
-    let (private_key, _) = keys.get(&0).expect("Can't key the private key");
+    let (private_key, _) = keys.get(&AccountId(0)).expect("Can't key the private key");
 
-    let from_account = state.get_account(0).expect("Can't get the account");
+    let from_account = state
+        .get_account(AccountId(0))
+        .expect("Can't get the account");
 
     let transfer = Transfer::new_signed(
-        0,
+        AccountId(0),
         from_account.address,
         Address::random(),
         ETH_TOKEN_ID,
         10u32.into(),
         1u32.into(),
-        0,
+        Nonce(0),
+        Default::default(),
         private_key,
     )
     .expect("failed to sign transfer");
     let transfer_tx = ZkSyncTx::Transfer(Box::new(transfer));
 
-    let setup = || (state.clone(), transfer_tx.clone());
+    let setup = || state.clone();
 
-    b.iter_batched(
+    b.iter_batched_ref(
         setup,
-        |(mut state, transfer_tx)| {
+        |state| {
             state
-                .execute_tx(black_box(transfer_tx))
+                .execute_tx(black_box(transfer_tx.clone()), DEFAULT_TIMESTAMP)
                 .expect("Failed to execute tx");
         },
         BatchSize::SmallInput,
@@ -96,32 +99,37 @@ fn apply_transfer_to_new_op(b: &mut Bencher<'_>) {
 /// Bench for `ZkSyncState::apply_transfer_op`.
 fn apply_transfer_tx(b: &mut Bencher<'_>) {
     let (keys, state) = generate_state();
-    let (private_key, _) = keys.get(&0).expect("Can't key the private key");
+    let (private_key, _) = keys.get(&AccountId(0)).expect("Can't key the private key");
 
-    let from_account = state.get_account(0).expect("Can't get the account");
-    let to_account = state.get_account(1).expect("Can't get the account");
+    let from_account = state
+        .get_account(AccountId(0))
+        .expect("Can't get the account");
+    let to_account = state
+        .get_account(AccountId(1))
+        .expect("Can't get the account");
 
     let transfer = Transfer::new_signed(
-        0,
+        AccountId(0),
         from_account.address,
         to_account.address,
         ETH_TOKEN_ID,
         10u32.into(),
         1u32.into(),
-        0,
+        Nonce(0),
+        Default::default(),
         private_key,
     )
     .expect("failed to sign transfer");
 
     let transfer_tx = ZkSyncTx::Transfer(Box::new(transfer));
 
-    let setup = || (state.clone(), transfer_tx.clone());
+    let setup = || state.clone();
 
-    b.iter_batched(
+    b.iter_batched_ref(
         setup,
-        |(mut state, transfer_tx)| {
+        |state| {
             state
-                .execute_tx(black_box(transfer_tx))
+                .execute_tx(black_box(transfer_tx.clone()), DEFAULT_TIMESTAMP)
                 .expect("Failed to execute tx");
         },
         BatchSize::SmallInput,
@@ -132,22 +140,25 @@ fn apply_transfer_tx(b: &mut Bencher<'_>) {
 fn apply_full_exit_tx(b: &mut Bencher<'_>) {
     let (_, state) = generate_state();
 
-    let from_account = state.get_account(0).expect("Can't get the account");
+    let from_account = state
+        .get_account(AccountId(0))
+        .expect("Can't get the account");
 
     let full_exit = FullExit {
-        account_id: 0,
+        account_id: AccountId(0),
         eth_address: from_account.address,
         token: ETH_TOKEN_ID,
+        is_legacy: false,
     };
 
     let full_exit_op = ZkSyncPriorityOp::FullExit(full_exit);
 
-    let setup = || (state.clone(), full_exit_op.clone());
+    let setup = || state.clone();
 
-    b.iter_batched(
+    b.iter_batched_ref(
         setup,
-        |(mut state, full_exit_op)| {
-            let _ = state.execute_priority_op(black_box(full_exit_op));
+        |state| {
+            let _ = state.execute_priority_op(black_box(full_exit_op.clone()));
         },
         BatchSize::SmallInput,
     );
@@ -157,7 +168,9 @@ fn apply_full_exit_tx(b: &mut Bencher<'_>) {
 fn apply_deposit_tx(b: &mut Bencher<'_>) {
     let (_, state) = generate_state();
 
-    let to_account = state.get_account(0).expect("Can't get the account");
+    let to_account = state
+        .get_account(AccountId(0))
+        .expect("Can't get the account");
 
     let deposit = Deposit {
         from: Address::random(),
@@ -168,12 +181,12 @@ fn apply_deposit_tx(b: &mut Bencher<'_>) {
 
     let deposit_op = ZkSyncPriorityOp::Deposit(deposit);
 
-    let setup = || (state.clone(), deposit_op.clone());
+    let setup = || state.clone();
 
-    b.iter_batched(
+    b.iter_batched_ref(
         setup,
-        |(mut state, deposit_op)| {
-            let _ = state.execute_priority_op(black_box(deposit_op));
+        |state| {
+            let _ = state.execute_priority_op(black_box(deposit_op.clone()));
         },
         BatchSize::SmallInput,
     );
@@ -183,29 +196,32 @@ fn apply_deposit_tx(b: &mut Bencher<'_>) {
 fn apply_withdraw_tx(b: &mut Bencher<'_>) {
     let (keys, state) = generate_state();
 
-    let from_account = state.get_account(0).expect("Can't get the account");
-    let (private_key, _) = keys.get(&0).expect("Can't key the private key");
+    let from_account = state
+        .get_account(AccountId(0))
+        .expect("Can't get the account");
+    let (private_key, _) = keys.get(&AccountId(0)).expect("Can't key the private key");
 
     let withdraw = Withdraw::new_signed(
-        0,
+        AccountId(0),
         from_account.address,
         Address::random(),
         ETH_TOKEN_ID,
         10u32.into(),
         1u32.into(),
-        0,
+        Nonce(0),
+        Default::default(),
         private_key,
     )
     .expect("failed to sign withdraw");
 
     let withdraw_tx = ZkSyncTx::Withdraw(Box::new(withdraw));
 
-    let setup = || (state.clone(), withdraw_tx.clone());
+    let setup = || state.clone();
 
-    b.iter_batched(
+    b.iter_batched_ref(
         setup,
-        |(mut state, withdraw_tx)| {
-            let _ = state.execute_tx(black_box(withdraw_tx));
+        |state| {
+            let _ = state.execute_tx(black_box(withdraw_tx.clone()), DEFAULT_TIMESTAMP);
         },
         BatchSize::SmallInput,
     );
@@ -217,8 +233,10 @@ fn apply_withdraw_tx(b: &mut Bencher<'_>) {
 fn apply_change_pubkey_op(b: &mut Bencher<'_>) {
     let (keys, state) = generate_state();
 
-    let to_change = state.get_account(0).expect("Can't get the account");
-    let (_, eth_private_key) = keys.get(&0).expect("Can't key the private key");
+    let to_change = state
+        .get_account(AccountId(0))
+        .expect("Can't get the account");
+    let (_, eth_private_key) = keys.get(&AccountId(0)).expect("Can't key the private key");
 
     let rng = &mut thread_rng();
     let new_sk = priv_key_from_fs(rng.gen());
@@ -226,12 +244,13 @@ fn apply_change_pubkey_op(b: &mut Bencher<'_>) {
     let nonce = 0;
 
     let mut change_pubkey = ChangePubKey::new(
-        0,
+        AccountId(0),
         to_change.address,
         PubKeyHash::from_privkey(&new_sk),
-        0,
+        TokenId(0),
         Default::default(),
-        nonce,
+        Nonce(nonce),
+        Default::default(),
         None,
         None,
     );
@@ -242,20 +261,23 @@ fn apply_change_pubkey_op(b: &mut Bencher<'_>) {
             .expect("Failed to construct ChangePubKey signed message.");
         let eth_signature =
             PackedEthSignature::sign(eth_private_key, &sign_bytes).expect("Signing failed");
-        ChangePubKeyEthAuthData::ECDSA(ChangePubKeyECDSAData {
+        Some(ChangePubKeyEthAuthData::ECDSA(ChangePubKeyECDSAData {
             eth_signature,
             batch_hash: H256::zero(),
-        })
+        }))
     };
+
+    // Verify signature out of state, so it'll be cached.
+    change_pubkey.check_correctness().unwrap();
 
     let change_pubkey_tx = ZkSyncTx::ChangePubKey(Box::new(change_pubkey));
 
-    let setup = || (state.clone(), change_pubkey_tx.clone());
+    let setup = || state.clone();
 
-    b.iter_batched(
+    b.iter_batched_ref(
         setup,
-        |(mut state, change_pubkey_tx)| {
-            let _ = state.execute_tx(black_box(change_pubkey_tx));
+        |state| {
+            let _ = state.execute_tx(black_box(change_pubkey_tx.clone()), DEFAULT_TIMESTAMP);
         },
         BatchSize::SmallInput,
     );
@@ -269,12 +291,12 @@ fn insert_account(b: &mut Bencher<'_>) {
     let (_, state) = generate_state();
 
     let (_, _, to_insert) = generate_account();
-    let setup = || (state.clone(), to_insert.clone());
+    let setup = || state.clone();
 
-    b.iter_batched(
+    b.iter_batched_ref(
         setup,
-        |(mut state, to_insert)| {
-            state.insert_account(black_box(ACCOUNTS_AMOUNT), to_insert);
+        |state| {
+            state.insert_account(black_box(ACCOUNTS_AMOUNT), to_insert.clone());
         },
         BatchSize::SmallInput,
     );

@@ -2,23 +2,26 @@ const fs = require('fs');
 
 const wasmFile = './dist/zksync-crypto-web_bg.wasm';
 const jsFile = './dist/zksync-crypto-web.js';
+// The output of wasm2js with a fixed import.
+const asmJsFile = './zksync-crypto-bundler_asm.js';
 
 const wasmData = fs.readFileSync(wasmFile);
 
 // Strings that are inserted automatically by wasm-pack, but
 // break library in it's current implementation
 const brokenStrings = [
-  // This substring is unique, had to
-  // write only part of line to make the RegExp works.
-  // Probably will rewrite in the future
-  `input = import.meta.url.replace`
+    // This substring is unique, had to
+    // write only part of line to make the RegExp works.
+    // Probably will rewrite in the future
+    `input = import.meta.url.replace`,
+    `input = new URL`
 ];
 
 let jsCode = fs.readFileSync(jsFile).toString();
 
 // Commenting out broken strings
 brokenStrings.forEach((str) => {
-  jsCode = jsCode.replace(new RegExp(str, 'g'), '// ' + str);
+    jsCode = jsCode.replace(new RegExp(str, 'g'), '// ' + str);
 });
 
 jsCode += `
@@ -46,7 +49,21 @@ const wasmResponseInit = {
   }
 };
 
+export function wasmSupported() {
+  try {
+    if (typeof WebAssembly === 'object') {
+      return true;
+    }
+  } catch (e) {
+  }
+  return false;
+}
+
 export async function loadZkSyncCrypto(wasmFileUrl) {
+  if (!wasmSupported()) {
+    // Use the bundler build.
+    return require(\'${asmJsFile}\');
+  }
   if (!wasmFileUrl) {
     const wasmResponse = new Response(wasmBytes, wasmResponseInit);
     await init(wasmResponse);

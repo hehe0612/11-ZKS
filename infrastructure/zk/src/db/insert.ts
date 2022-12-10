@@ -2,6 +2,7 @@ import { Command } from 'commander';
 import * as utils from '../utils';
 import * as env from '../env';
 import fetch from 'node-fetch';
+import { web3Url } from '../utils';
 
 const SQL = () => `psql "${process.env.DATABASE_URL}" -c`;
 
@@ -15,12 +16,14 @@ export async function token(id: string, address: string, symbol: string, preciso
 export async function contract() {
     // force read env
     env.reload();
-    const contractAddress = process.env.CONTRACT_ADDR;
-    const governanceAddress = process.env.GOVERNANCE_ADDR;
-    await utils.exec(`${SQL()} "INSERT INTO server_config (contract_addr, gov_contract_addr)
-					 VALUES ('${contractAddress}', '${governanceAddress}')
+    const contractAddress = process.env.CONTRACTS_CONTRACT_ADDR;
+    const governanceAddress = process.env.CONTRACTS_GOVERNANCE_ADDR;
+    const nftFactoryAddress = process.env.CONTRACTS_NFT_FACTORY_ADDR;
+    await utils.exec(`${SQL()} "INSERT INTO server_config (contract_addr, gov_contract_addr, nft_factory_addr)
+					 VALUES ('${contractAddress}', '${governanceAddress}', '${nftFactoryAddress}')
 					 ON CONFLICT (id) DO UPDATE
-					 SET (contract_addr, gov_contract_addr) = ('${contractAddress}', '${governanceAddress}')"`);
+					 SET (contract_addr, gov_contract_addr, nft_factory_addr) 
+                        = ('${contractAddress}', '${governanceAddress}', '${nftFactoryAddress}')"`);
     console.log('Successfully inserted contract address into the database');
 }
 
@@ -31,10 +34,10 @@ export async function ethData() {
     const body = {
         jsonrpc: '2.0',
         method: 'eth_getTransactionCount',
-        params: [process.env.OPERATOR_COMMIT_ETH_ADDRESS as string, 'pending'],
+        params: [process.env.ETH_SENDER_SENDER_OPERATOR_COMMIT_ETH_ADDR as string, 'pending'],
         id: 1
     };
-    const reponse = await fetch(process.env.WEB3_URL as string, {
+    const reponse = await fetch(web3Url(), {
         method: 'post',
         body: JSON.stringify(body),
         headers: {
@@ -43,9 +46,9 @@ export async function ethData() {
         }
     });
     const nonce = parseInt((await reponse.json()).result);
-    await utils.exec(`${SQL()} "INSERT INTO eth_parameters (nonce, gas_price_limit, commit_ops, verify_ops, withdraw_ops)
-                     VALUES ('${nonce}', '${process.env.ETH_GAS_PRICE_DEFAULT_LIMIT}', 0, 0, 0)
-                     ON CONFLICT (id) DO UPDATE SET (commit_ops, verify_ops, withdraw_ops) = (0, 0, 0)"`);
+    await utils.exec(`${SQL()} "INSERT INTO eth_parameters (nonce, gas_price_limit, last_committed_block, last_verified_block, last_executed_block)
+                     VALUES ('${nonce}', '${process.env.ETH_SENDER_GAS_PRICE_LIMIT_DEFAULT}', 0, 0, 0)
+                     ON CONFLICT (id) DO UPDATE SET (nonce, last_committed_block, last_verified_block, last_executed_block) = ('${nonce}', 0, 0, 0)"`);
 }
 
 export const command = new Command('insert').description('insert pre-defined data into the database');

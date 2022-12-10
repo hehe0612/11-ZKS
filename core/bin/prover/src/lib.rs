@@ -1,7 +1,7 @@
 pub mod auth_utils;
 pub mod cli_utils;
 pub mod client;
-pub mod exit_proof;
+pub mod dummy_prover;
 pub mod plonk_step_by_step_prover;
 
 // Built-in deps
@@ -19,9 +19,9 @@ use zksync_crypto::rand::{
     thread_rng,
 };
 // Workspace deps
-use zksync_config::ProverOptions;
+use zksync_config::ProverConfig as EnvProverConfig;
 use zksync_prover_utils::api::{
-    JobRequestData, JobResultData, ProverId, ProverInputRequest, ProverInputRequestAuxData,
+    JobRequestData, JobResultData, ProverInputRequest, ProverInputRequestAuxData,
     ProverInputResponse, ProverOutputRequest,
 };
 
@@ -75,22 +75,23 @@ pub trait ProverConfig {
 /// It is still assumed that prover will use ApiClient methods to fetch data from server, but it
 /// allows to use common code for all provers (like sending heartbeats, registering prover, etc.)
 pub trait ProverImpl {
-    /// Config concrete type used by current prover
+    /// Config concrete type used by current prover.
     type Config: ProverConfig;
     /// Creates prover from config and API client.
     fn create_from_config(config: Self::Config) -> Self;
     fn get_request_aux_data(&self) -> ProverInputRequestAuxData {
         Default::default()
+        // TODO: Add the ability to define different config (ZKS-283).
     }
     /// Resource heavy operation
-    fn create_proof(&self, data: JobRequestData) -> Result<JobResultData, anyhow::Error>;
+    fn create_proof(&self, data: JobRequestData) -> anyhow::Result<JobResultData>;
 }
 #[async_trait::async_trait]
 pub trait ApiClient: Debug {
-    async fn get_job(&self, req: ProverInputRequest) -> Result<ProverInputResponse, anyhow::Error>;
-    async fn working_on(&self, job_id: i32, prover_name: &str) -> Result<(), anyhow::Error>;
-    async fn publish(&self, data: ProverOutputRequest) -> Result<(), anyhow::Error>;
-    async fn prover_stopped(&self, prover_id: ProverId) -> Result<(), anyhow::Error>;
+    async fn get_job(&self, req: ProverInputRequest) -> anyhow::Result<ProverInputResponse>;
+    async fn working_on(&self, job_id: i32, prover_name: &str) -> anyhow::Result<()>;
+    async fn publish(&self, data: ProverOutputRequest) -> anyhow::Result<()>;
+    async fn prover_stopped(&self, prover_name: String) -> anyhow::Result<()>;
 }
 
 async fn compute_proof_no_blocking<PROVER>(
@@ -101,7 +102,6 @@ where
     PROVER: ProverImpl + Send + Sync + 'static,
 {
     let (result_sender, result_receiver) = oneshot::channel();
-    // TODO: somehow kill prover on main thread kill
     std::thread::spawn(move || {
         let prover_with_proof = prover.create_proof(data).map(|proof| (prover, proof));
         result_sender.send(prover_with_proof).unwrap_or_default();
@@ -109,18 +109,47 @@ where
     result_receiver.await?
 }
 
-async fn prover_work_cycle<PROVER, CLIENT>(
+/// Endlessly sends requests to the server, in case of not receiving a response
+/// notifies about it in the logs, but does not quit.
+async fn heartbeat_future_handle<CLIENT>(
+    client: CLIENT,
+    prover_name: &str,
+    job_id: i32,
+    heartbeat_interval: Duration,
+) where
+    CLIENT: 'static + Sync + Send + ApiClient,
+{
+    loop {
+        let timeout_value = {
+            let between = Range::new(0.8f64, 2.0);
+            let mut rng = thread_rng();
+            let random_multiplier = between.ind_sample(&mut rng);
+            Duration::from_secs((heartbeat_interval.as_secs_f64() * random_multiplier) as u64)
+        };
+        tokio::time::sleep(timeout_value).await;
+
+        vlog::debug!("Starting sending heartbeats for job with ID: {}", job_id);
+
+        client
+            .working_on(job_id, prover_name)
+            .await
+            .map_err(|e| vlog::warn!("Failed to send heartbeat: {}", e))
+            .unwrap_or_default();
+    }
+}
+
+pub async fn prover_work_cycle<PROVER, CLIENT>(
     mut prover: PROVER,
     client: CLIENT,
     shutdown: ShutdownRequest,
-    prover_options: ProverOptions,
+    prover_options: EnvProverConfig,
+    prover_name: &str,
 ) where
-    CLIENT: 'static + Sync + Send + ApiClient,
+    CLIENT: 'static + Sync + Send + ApiClient + Clone,
     PROVER: ProverImpl + Send + Sync + 'static,
 {
-    let prover_name = String::from("localhost");
-
-    let mut new_job_poll_timer = tokio::time::interval(prover_options.cycle_wait);
+    vlog::info!("Running worker cycle");
+    let mut new_job_poll_timer = tokio::time::interval(prover_options.prover.cycle_wait());
     loop {
         new_job_poll_timer.tick().await;
 
@@ -131,14 +160,14 @@ async fn prover_work_cycle<PROVER, CLIENT>(
         let aux_data = prover.get_request_aux_data();
         let prover_input_response = match client
             .get_job(ProverInputRequest {
-                prover_name: prover_name.clone(),
+                prover_name: prover_name.to_string(),
                 aux_data,
             })
             .await
         {
             Ok(job) => job,
             Err(e) => {
-                log::warn!("Failed to get job for prover: {}", e);
+                vlog::warn!("Failed to get job for prover: {}", e);
                 continue;
             }
         };
@@ -155,31 +184,29 @@ async fn prover_work_cycle<PROVER, CLIENT>(
             continue;
         };
 
-        let heartbeat_future_handle = async {
-            loop {
-                let timeout_value = {
-                    let between = Range::new(0.8f64, 2.0);
-                    let mut rng = thread_rng();
-                    let random_multiplier = between.ind_sample(&mut rng);
-                    Duration::from_secs(
-                        (prover_options.heartbeat_interval.as_secs_f64() * random_multiplier)
-                            as u64,
-                    )
-                };
+        vlog::info!(
+            "got job id: {}, blocks: [{}, {}]",
+            job_id,
+            first_block,
+            last_block
+        );
 
-                tokio::time::delay_for(timeout_value).await;
-                client
-                    .working_on(job_id, &prover_name)
-                    .await
-                    .map_err(|e| log::warn!("Failed to send hearbeat: {}", e))
-                    .unwrap_or_default();
-            }
-        }
+        let heartbeat_future_handle = heartbeat_future_handle(
+            client.clone(),
+            prover_name,
+            job_id,
+            prover_options.prover.heartbeat_interval(),
+        )
         .fuse();
-        pin_mut!(heartbeat_future_handle);
-
         let compute_proof_future = compute_proof_no_blocking(prover, job_data).fuse();
-        pin_mut!(compute_proof_future);
+
+        pin_mut!(heartbeat_future_handle, compute_proof_future);
+
+        vlog::info!(
+            "starting to compute proof for blocks: [{}, {}]",
+            first_block,
+            last_block
+        );
 
         let (ret_prover, proof) = futures::select! {
             comp_proof = compute_proof_future => {
@@ -197,7 +224,16 @@ async fn prover_work_cycle<PROVER, CLIENT>(
                 data: proof,
             })
             .await
-            .map_err(|e| log::warn!("Failed to publish proof: {}", e))
+            .map_err(|e| vlog::warn!("Failed to publish proof: {}", e))
             .unwrap_or_default();
+
+        vlog::info!(
+            "finished and published proof for blocks: [{}, {}]",
+            first_block,
+            last_block
+        );
+        if prover_options.prover.die_after_proof {
+            return;
+        }
     }
 }

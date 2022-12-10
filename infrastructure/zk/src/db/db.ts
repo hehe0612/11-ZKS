@@ -33,16 +33,29 @@ export async function migrate() {
 }
 
 export async function setup() {
+    await basicSetup();
+    if (!process.env.CI) {
+        // We expect `SQLX_DATA` to be correct.
+        await utils.spawn('cargo sqlx prepare --check -- --tests || cargo sqlx prepare -- --tests');
+    }
+    process.chdir(process.env.ZKSYNC_HOME as string);
+}
+
+export async function basicSetup() {
     // force read env
     env.reload();
 
     process.chdir('core/lib/storage');
-    console.log(`DATABASE_URL = ${process.env.DATABASE_URL}`);
+    if (process.env.DATABASE_URL == 'postgres://postgres@localhost/plasma') {
+        console.log(`Using localhost database:`);
+        console.log(`DATABASE_URL = ${process.env.DATABASE_URL}`);
+    } else {
+        // Remote database, we can't show the contents.
+        console.log(`WARNING! Using prod db!`);
+    }
     await utils.exec('diesel database setup');
     await utils.exec('diesel migration run');
     fs.unlinkSync('src/schema.rs.generated');
-    await utils.spawn('cargo sqlx prepare --check || cargo sqlx prepare');
-    process.chdir(process.env.ZKSYNC_HOME as string);
 }
 
 export async function updateToken(token: string, symbol: string) {
@@ -66,6 +79,10 @@ export const command = new Command('db')
 
 command.command('drop').description('drop the database').action(drop);
 command.command('migrate').description('run migrations').action(migrate);
+command
+    .command('basic-setup')
+    .description('initialize the database and perform migrations (without sqlx call)')
+    .action(basicSetup);
 command.command('setup').description('initialize the database and perform migrations').action(setup);
 command.command('wait').description('wait for database to get ready for interaction').action(wait);
 command.command('reset').description('reinitialize the database').action(reset);

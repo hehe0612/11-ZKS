@@ -2,6 +2,8 @@ import { ethers } from 'ethers';
 import { readContractCode, readProductionContracts } from '../src.ts/deploy';
 import { Interface } from 'ethers/lib/utils';
 import * as chalk from 'chalk';
+import { web3Url } from './utils';
+
 const contracts = readProductionContracts();
 const franklinInterface = new Interface(contracts.zkSync.abi);
 const governanceInterface = new Interface(contracts.governance.abi);
@@ -20,7 +22,7 @@ function hex_to_ascii(str1) {
 async function reason() {
     const args = process.argv.slice(2);
     const hash = args[0];
-    const web3 = args[1] == null ? process.env.WEB3_URL : args[1];
+    const web3 = args[1] == null ? web3Url() : args[1];
     console.log('tx hash:', hash);
     console.log('provider:', web3);
 
@@ -55,7 +57,7 @@ async function reason() {
 
             // If more than 90% of gas was used, report it as an error.
             const threshold = gasLimit.mul(90).div(100);
-            if (gasUsed >= threshold) {
+            if (gasUsed.gte(threshold)) {
                 const error = chalk.bold.red;
                 console.log(error('More than 90% of gas limit was used!'));
                 console.log(error('It may be the reason of the transaction failure'));
@@ -72,6 +74,7 @@ async function reason() {
         }
 
         for (const log of receipt.logs) {
+            console.log(log);
             try {
                 let parsedLog = franklinInterface.parseLog(log);
                 if (!parsedLog) {
@@ -93,4 +96,9 @@ async function reason() {
     }
 }
 
-reason();
+reason()
+    .then(() => process.exit(0))
+    .catch((err) => {
+        console.error('Error:', err.message || err);
+        process.exit(1);
+    });

@@ -8,14 +8,17 @@ import { command as down } from './down';
 import { command as db } from './db/db';
 import { command as contract } from './contract';
 import { command as dummyProver } from './dummy-prover';
-import { command as init } from './init';
+import { initCommand as init, reinitCommand as reinit } from './init';
 import { command as kube } from './kube';
 import { command as prover } from './prover';
 import { command as run } from './run/run';
 import { command as test } from './test/test';
 import { command as docker } from './docker';
 import { command as fmt } from './fmt';
+import { command as lint } from './lint';
 import { command as completion } from './completion';
+import { command as config } from './config';
+import { command as apiDocs } from './api-docs';
 import * as env from './env';
 
 const COMMANDS = [
@@ -26,12 +29,16 @@ const COMMANDS = [
     contract,
     dummyProver,
     init,
+    reinit,
     kube,
     prover,
     run,
     test,
     fmt,
+    lint,
     docker,
+    config,
+    apiDocs,
     env.command,
     completion(program as Command)
 ];
@@ -46,7 +53,7 @@ async function main() {
         process.chdir(ZKSYNC_HOME);
     }
 
-    env.load();
+    await env.load();
 
     program.version('0.1.0').name('zk').description('zksync workflow tools');
 

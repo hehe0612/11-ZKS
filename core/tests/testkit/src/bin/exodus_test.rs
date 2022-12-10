@@ -11,13 +11,14 @@
 use crate::eth_account::{parse_ether, EthereumAccount};
 use crate::external_commands::{deploy_contracts, get_test_accounts};
 use crate::zksync_account::ZkSyncAccount;
-use log::*;
 use num::BigUint;
 use std::time::Instant;
+use vlog::*;
 use web3::transports::Http;
-use zksync_crypto::proof::EncodedAggregatedProof;
+use zksync_crypto::proof::EncodedSingleProof;
+use zksync_testkit::zksync_account::ZkSyncETHAccountData;
 use zksync_testkit::*;
-use zksync_types::{AccountId, AccountMap};
+use zksync_types::{AccountId, AccountMap, Nonce, PriorityOp, TokenId};
 
 const PRIORITY_EXPIRATION: u64 = 101;
 
@@ -53,16 +54,14 @@ async fn commit_deposit_to_expire(
     to: ZKSyncAccountId,
     token: Token,
     deposit_amount: &BigUint,
-) -> u64 {
+) -> (u64, Vec<PriorityOp>) {
     info!("Commit deposit to expire");
-    // test_setup.start_block();
-    test_setup
+    let (_, priority_op) = test_setup
         .deposit(from, to, token, deposit_amount.clone())
         .await;
-    // test_setup.execute_commit_block().await.0.expect_success();
 
     info!("Done commit deposit to expire");
-    test_setup.eth_block_number().await
+    (test_setup.eth_block_number().await, vec![priority_op])
 }
 
 // Trigger exodus mode using `eth_account`, it is preferred to use not operator account for this
@@ -86,26 +85,29 @@ async fn trigger_exodus(
     info!("Done triggering exodus");
 }
 
+#[allow(dead_code)]
 async fn cancel_outstanding_deposits(
     test_setup: &TestSetup,
     deposit_receiver_account: ETHAccountId,
     deposit_token: Token,
     deposit_amount: &BigUint,
+    expired_priority_ops: &[PriorityOp],
     call_cancel_account: ETHAccountId,
 ) {
     info!("Canceling outstangind deposits");
+    let token_address = test_setup.tokens[&deposit_token.0];
     let balance_to_withdraw_before = test_setup
-        .get_balance_to_withdraw(deposit_receiver_account, deposit_token)
+        .get_balance_to_withdraw(deposit_receiver_account, token_address)
         .await;
 
+    let (number, data) = PriorityOp::get_args_for_priority_queue_cancel(expired_priority_ops);
     test_setup
-        .cancel_outstanding_deposits(call_cancel_account)
+        .cancel_outstanding_deposits(call_cancel_account, number, data)
         .await;
 
     let balance_to_withdraw_after = test_setup
-        .get_balance_to_withdraw(deposit_receiver_account, deposit_token)
+        .get_balance_to_withdraw(deposit_receiver_account, token_address)
         .await;
-
     assert_eq!(
         balance_to_withdraw_before + deposit_amount,
         balance_to_withdraw_after,
@@ -123,19 +125,20 @@ async fn check_exit_garbage_proof(
 ) {
     info!(
         "Checking exit with garbage proof token: {}, amount: {}",
-        token.0, amount
+        *token.0, amount
     );
-    let proof = EncodedAggregatedProof::default();
+    let proof = EncodedSingleProof::default();
     test_setup
         .exit(
             send_account,
-            fund_owner.0 as AccountId,
+            AccountId(fund_owner.0 as u32),
             token,
             amount,
+            Default::default(),
             proof,
         )
         .await
-        .expect_revert("fet13");
+        .expect_revert("x");
     info!("Done cheching exit with garbage proof");
 }
 
@@ -148,11 +151,16 @@ async fn check_exit_correct_proof(
     amount: &BigUint,
 ) {
     info!("Checking exit with correct proof");
+    let token_address = test_setup.tokens[&token.0];
     let balance_to_withdraw_before = test_setup
-        .get_balance_to_withdraw(send_account, token)
+        .get_balance_to_withdraw(send_account, token_address)
         .await;
+    let zero_account = accounts
+        .get(&AccountId(0))
+        .expect("Zero account does not exist")
+        .to_owned();
 
-    let (proof, exit_amount) = test_setup.gen_exit_proof(accounts, fund_owner, token);
+    let (proof, exit_amount) = test_setup.gen_exit_proof_fungible(accounts, fund_owner, token);
     assert_eq!(
         &exit_amount, amount,
         "Exit proof generated with unexpected amount"
@@ -168,12 +176,19 @@ async fn check_exit_correct_proof(
         .expect("Account should exits")
         .0;
     test_setup
-        .exit(send_account, account_id, token, &exit_amount, proof)
+        .exit(
+            send_account,
+            account_id,
+            token,
+            &exit_amount,
+            zero_account.address,
+            proof,
+        )
         .await
         .expect_success();
 
     let balance_to_withdraw_after = test_setup
-        .get_balance_to_withdraw(send_account, token)
+        .get_balance_to_withdraw(send_account, token_address)
         .await;
 
     assert_eq!(
@@ -193,11 +208,16 @@ async fn check_exit_correct_proof_second_time(
     amount: &BigUint,
 ) {
     info!("Checking exit with correct proof twice");
+    let token_address = test_setup.tokens[&token.0];
     let balance_to_withdraw_before = test_setup
-        .get_balance_to_withdraw(send_account, token)
+        .get_balance_to_withdraw(send_account, token_address)
         .await;
+    let zero_account = accounts
+        .get(&AccountId(0))
+        .expect("Zero account does not exist")
+        .to_owned();
 
-    let (proof, exit_amount) = test_setup.gen_exit_proof(accounts, fund_owner, token);
+    let (proof, exit_amount) = test_setup.gen_exit_proof_fungible(accounts, fund_owner, token);
     assert_eq!(
         &exit_amount, amount,
         "Exit proof generated with unexpected amount"
@@ -208,12 +228,19 @@ async fn check_exit_correct_proof_second_time(
         .expect("Account should exits")
         .0;
     test_setup
-        .exit(send_account, account_id, token, &exit_amount, proof)
+        .exit(
+            send_account,
+            account_id,
+            token,
+            &exit_amount,
+            zero_account.address,
+            proof,
+        )
         .await
-        .expect_revert("fet12");
+        .expect_revert("t");
 
     let balance_to_withdraw_after = test_setup
-        .get_balance_to_withdraw(send_account, token)
+        .get_balance_to_withdraw(send_account, token_address)
         .await;
 
     assert_eq!(
@@ -233,11 +260,16 @@ async fn check_exit_correct_proof_other_token(
     false_token: Token,
 ) {
     info!("Checking exit with correct proof other token");
+    let token_address = test_setup.tokens[&token.0];
     let balance_to_withdraw_before = test_setup
-        .get_balance_to_withdraw(send_account, token)
+        .get_balance_to_withdraw(send_account, token_address)
         .await;
+    let zero_account = accounts
+        .get(&AccountId(0))
+        .expect("Zero account does not exist")
+        .to_owned();
 
-    let (proof, exit_amount) = test_setup.gen_exit_proof(accounts, fund_owner, token);
+    let (proof, exit_amount) = test_setup.gen_exit_proof_fungible(accounts, fund_owner, token);
     assert_eq!(
         &exit_amount, amount,
         "Exit proof generated with unexpected amount"
@@ -248,12 +280,19 @@ async fn check_exit_correct_proof_other_token(
         .expect("Account should exits")
         .0;
     test_setup
-        .exit(send_account, account_id, false_token, &exit_amount, proof)
+        .exit(
+            send_account,
+            account_id,
+            false_token,
+            &exit_amount,
+            zero_account.address,
+            proof,
+        )
         .await
-        .expect_revert("fet13");
+        .expect_revert("x");
 
     let balance_to_withdraw_after = test_setup
-        .get_balance_to_withdraw(send_account, token)
+        .get_balance_to_withdraw(send_account, token_address)
         .await;
 
     assert_eq!(
@@ -273,11 +312,16 @@ async fn check_exit_correct_proof_other_amount(
     false_amount: &BigUint,
 ) {
     info!("Checking exit with correct proof other amount");
+    let token_address = test_setup.tokens[&token.0];
     let balance_to_withdraw_before = test_setup
-        .get_balance_to_withdraw(send_account, token)
+        .get_balance_to_withdraw(send_account, token_address)
         .await;
+    let zero_account = accounts
+        .get(&AccountId(0))
+        .expect("Zero account does not exist")
+        .to_owned();
 
-    let (proof, exit_amount) = test_setup.gen_exit_proof(accounts, fund_owner, token);
+    let (proof, exit_amount) = test_setup.gen_exit_proof_fungible(accounts, fund_owner, token);
     assert_eq!(
         &exit_amount, amount,
         "Exit proof generated with unexpected amount"
@@ -288,12 +332,19 @@ async fn check_exit_correct_proof_other_amount(
         .expect("Account should exits")
         .0;
     test_setup
-        .exit(send_account, account_id, token, false_amount, proof)
+        .exit(
+            send_account,
+            account_id,
+            token,
+            false_amount,
+            zero_account.address,
+            proof,
+        )
         .await
-        .expect_revert("fet13");
+        .expect_revert("x");
 
     let balance_to_withdraw_after = test_setup
-        .get_balance_to_withdraw(send_account, token)
+        .get_balance_to_withdraw(send_account, token_address)
         .await;
 
     assert_eq!(
@@ -311,12 +362,17 @@ async fn check_exit_correct_proof_incorrect_sender(
     token: Token,
     amount: &BigUint,
 ) {
+    let token_address = test_setup.tokens[&token.0];
     info!("Checking exit with correct proof and incorrect sender");
     let balance_to_withdraw_before = test_setup
-        .get_balance_to_withdraw(send_account, token)
+        .get_balance_to_withdraw(send_account, token_address)
         .await;
+    let zero_account = accounts
+        .get(&AccountId(0))
+        .expect("Zero account does not exist")
+        .to_owned();
 
-    let (proof, exit_amount) = test_setup.gen_exit_proof(accounts, fund_owner, token);
+    let (proof, exit_amount) = test_setup.gen_exit_proof_fungible(accounts, fund_owner, token);
     assert_eq!(
         &exit_amount, amount,
         "Exit proof generated with unexpected amount"
@@ -327,12 +383,19 @@ async fn check_exit_correct_proof_incorrect_sender(
         .expect("Account should exits")
         .0;
     test_setup
-        .exit(send_account, account_id, token, &exit_amount, proof)
+        .exit(
+            send_account,
+            account_id,
+            token,
+            &exit_amount,
+            zero_account.address,
+            proof,
+        )
         .await
-        .expect_revert("fet13");
+        .expect_revert("x");
 
     let balance_to_withdraw_after = test_setup
-        .get_balance_to_withdraw(send_account, token)
+        .get_balance_to_withdraw(send_account, token_address)
         .await;
 
     assert_eq!(
@@ -343,14 +406,14 @@ async fn check_exit_correct_proof_incorrect_sender(
 }
 
 async fn exit_test() {
-    env_logger::init();
+    vlog::init();
     let testkit_config = TestkitConfig::from_env();
 
     let fee_account = ZkSyncAccount::rand();
     let (sk_thread_handle, stop_state_keeper_sender, sk_channels) =
-        spawn_state_keeper(&fee_account.address);
+        spawn_state_keeper(&fee_account.address, genesis_state(&fee_account.address));
 
-    let initial_root_hash = genesis_state(&fee_account.address).tree.root_hash();
+    let initial_root_hash = genesis_state(&fee_account.address).state.root_hash();
 
     let deploy_timer = Instant::now();
     info!("deploying contracts");
@@ -393,9 +456,11 @@ async fn exit_test() {
             let rng_zksync_key = ZkSyncAccount::rand().private_key;
             ZkSyncAccount::new(
                 rng_zksync_key,
-                0,
+                Nonce(0),
                 eth_account.address,
-                eth_account.private_key,
+                ZkSyncETHAccountData::EOA {
+                    eth_private_key: eth_account.private_key,
+                },
             )
         }));
         zksync_accounts.push(fee_account);
@@ -419,6 +484,7 @@ async fn exit_test() {
         &contracts,
         commit_account,
         initial_root_hash,
+        None,
     );
 
     let deposit_amount = parse_ether("0.1").unwrap();
@@ -435,11 +501,11 @@ async fn exit_test() {
     let verified_accounts_state = test_setup.get_accounts_state().await;
 
     let expired_deposit_amount = parse_ether("0.3").unwrap();
-    let expire_count_start_block = commit_deposit_to_expire(
+    let (expire_count_start_block, expired_priority_ops) = commit_deposit_to_expire(
         &mut test_setup,
         ETHAccountId(0),
         ZKSyncAccountId(1),
-        Token(0),
+        Token(TokenId(0)),
         &expired_deposit_amount,
     )
     .await;
@@ -447,8 +513,9 @@ async fn exit_test() {
     cancel_outstanding_deposits(
         &test_setup,
         ETHAccountId(1),
-        Token(0),
+        Token(TokenId(0)),
         &expired_deposit_amount,
+        &expired_priority_ops,
         ETHAccountId(1),
     )
     .await;
@@ -458,9 +525,9 @@ async fn exit_test() {
         verified_accounts_state.clone(),
         ETHAccountId(1),
         ZKSyncAccountId(1),
-        Token(0),
+        Token(TokenId(0)),
         &deposit_amount,
-        Token(1),
+        Token(TokenId(1)),
     )
     .await;
     let incorrect_amount = BigUint::from(2u32) * deposit_amount.clone();
@@ -469,7 +536,7 @@ async fn exit_test() {
         verified_accounts_state.clone(),
         ETHAccountId(1),
         ZKSyncAccountId(1),
-        Token(0),
+        Token(TokenId(0)),
         &deposit_amount,
         &incorrect_amount,
     )
@@ -479,7 +546,7 @@ async fn exit_test() {
         &mut test_setup,
         ETHAccountId(1),
         ZKSyncAccountId(1),
-        Token(0),
+        Token(TokenId(0)),
         &deposit_amount,
     )
     .await;
@@ -489,7 +556,7 @@ async fn exit_test() {
         verified_accounts_state.clone(),
         ETHAccountId(0),
         ZKSyncAccountId(1),
-        Token(0),
+        Token(TokenId(0)),
         &deposit_amount,
     )
     .await;
@@ -499,7 +566,7 @@ async fn exit_test() {
         verified_accounts_state.clone(),
         ETHAccountId(1),
         ZKSyncAccountId(1),
-        Token(0),
+        Token(TokenId(0)),
         &deposit_amount,
     )
     .await;
@@ -509,7 +576,7 @@ async fn exit_test() {
         verified_accounts_state,
         ETHAccountId(1),
         ZKSyncAccountId(1),
-        Token(0),
+        Token(TokenId(0)),
         &deposit_amount,
     )
     .await;

@@ -4,7 +4,9 @@ import { Wallet } from 'ethers';
 import fs from 'fs';
 import * as path from 'path';
 import * as verifyKeys from './verify-keys';
+import * as eventListener from './event-listener';
 import * as dataRestore from './data-restore';
+import * as docker from '../docker';
 
 export { verifyKeys, dataRestore };
 
@@ -13,32 +15,46 @@ export async function deployERC20(command: 'dev' | 'new', name?: string, symbol?
         await utils.spawn(`yarn --silent --cwd contracts deploy-erc20 add-multi '
             [
                 { "name": "DAI",  "symbol": "DAI",  "decimals": 18 },
-                { "name": "wBTC", "symbol": "wBTC", "decimals":  8 },
+                { "name": "wBTC", "symbol": "wBTC", "decimals":  8, "implementation": "RevertTransferERC20" },
                 { "name": "BAT",  "symbol": "BAT",  "decimals": 18 },
+                { "name": "GNT",  "symbol": "GNT",  "decimals": 18 },
                 { "name": "MLTT", "symbol": "MLTT", "decimals": 18 }
             ]' > ./etc/tokens/localhost.json`);
+        if (!process.env.CI) {
+            await docker.restart('dev-liquidity-token-watcher');
+            await docker.restart('dev-ticker');
+        }
     } else if (command == 'new') {
         await utils.spawn(
-            `yarn --cwd contracts deploy-erc20 add --name ${name} --symbol ${symbol} --decimals ${decimals}`
+            `yarn --cwd contracts deploy-erc20 add --token-name ${name} --symbol ${symbol} --decimals ${decimals}`
         );
     }
 }
 
 export async function governanceAddERC20(command: 'dev' | 'new', address?: string) {
     if (command == 'dev') {
-        const tokens = JSON.parse(fs.readFileSync('./etc/tokens/localhost.json', { encoding: 'utf-8' })).map(
-            (token: { address: string }) => token.address
-        );
-        await utils.spawn(`yarn --silent --cwd contracts governance-add-erc20 add-multi '${tokens}'`);
+        await utils.spawn(`yarn --silent --cwd contracts governance-add-erc20 add-multi-current-network localhost`);
     } else if (command == 'new') {
-        await utils.spawn(`yarn --cwd contracts governance-add-erc20 add --tokenAddress ${address}`);
+        await utils.spawn(`yarn --cwd contracts governance-add-erc20 add ${address}`);
     }
+}
+
+export async function serverAddERC20(address: string, symbol: string, decimals: string) {
+    await utils.spawn(
+        `yarn --cwd contracts server-add-erc20 add --address ${address} --symbol ${symbol} --decimals ${decimals}`
+    );
+}
+
+export async function tokenInfo(address: string) {
+    await utils.spawn(`yarn --cwd contracts token-info info ${address}`);
 }
 
 // installs all dependencies and builds our js packages
 export async function yarn() {
     await utils.spawn('yarn');
-    await utils.spawn('yarn zksync prepublish');
+    await utils.spawn('yarn build:crypto');
+    await utils.spawn('yarn build:zksync-sdk');
+    await utils.spawn('yarn build:reading-tool');
 }
 
 export async function deployTestkit(genesisRoot: string, prodContracts: boolean = false) {
@@ -48,6 +64,10 @@ export async function deployTestkit(genesisRoot: string, prodContracts: boolean 
 
 export async function deployEIP1271() {
     await utils.spawn(`yarn contracts deploy-eip1271`);
+}
+
+export async function deployWithdrawalHelpersContracts() {
+    await utils.spawn(`yarn contracts deploy-withdrawal-helpers-contracts`);
 }
 
 export async function testUpgrade(contract: string, gatekeeper: string) {
@@ -71,7 +91,7 @@ export async function plonkSetup(powers?: number[]) {
 }
 
 export async function revertReason(txHash: string, web3url?: string) {
-    await utils.spawn(`cd contracts && yarn run ts-node scripts/revert-reason.ts ${txHash} ${web3url || ''}`);
+    await utils.spawn(`yarn contracts ts-node scripts/revert-reason.ts ${txHash} ${web3url || ''}`);
 }
 
 export async function explorer() {
@@ -110,13 +130,25 @@ export async function testAccounts() {
 
 export async function loadtest(...args: string[]) {
     console.log(args);
-    await utils.spawn(`cargo run --release --bin loadtest -- ${args.join(' ')}`);
+    await utils.spawn(`cargo run --release --bin loadnext -- ${args.join(' ')}`);
+}
+
+export async function readVariable(address: string, contractName: string, variableName: string, file?: string) {
+    if (file === undefined)
+        await utils.spawn(
+            `yarn --silent --cwd contracts read-variable read ${address} ${contractName} ${variableName}`
+        );
+    else
+        await utils.spawn(
+            `yarn --silent --cwd contracts read-variable read ${address} ${contractName} ${variableName} -f ${file}`
+        );
 }
 
 export const command = new Command('run')
     .description('run miscellaneous applications')
     .addCommand(verifyKeys.command)
-    .addCommand(dataRestore.command);
+    .addCommand(dataRestore.command)
+    .addCommand(eventListener.command);
 
 command.command('test-accounts').description('print ethereum test accounts').action(testAccounts);
 command.command('explorer').description('run zksync explorer locally').action(explorer);
@@ -145,6 +177,21 @@ command
     });
 
 command
+    .command('server-add-erc20 <address> <symbol> <decimals>')
+    .description('add testnet erc20 token to the zkSynk server')
+    .action(async (address: string, symbol: string, decimals: string) => {
+        await utils.confirmAction();
+        await serverAddERC20(address, symbol, decimals);
+    });
+
+command
+    .command('token-info <address>')
+    .description('get symbol, name and decimals parameters from token')
+    .action(async (address: string) => {
+        await tokenInfo(address);
+    });
+
+command
     .command('plonk-setup [powers]')
     .description('download missing keys')
     .action(async (powers?: string) => {
@@ -167,7 +214,7 @@ command
 command
     .command('deploy-eip1271')
     .description('deploy test EIP-1271 "smart wallet"')
-    .action(async (cmd: Command) => {
+    .action(async () => {
         await deployEIP1271();
     });
 
@@ -196,4 +243,15 @@ command
     .allowUnknownOption()
     .action(async (options: string[]) => {
         await loadtest(...options);
+    });
+
+command
+    .command('read-variable <address> <contractName> <variableName>')
+    .option(
+        '-f --file <file>',
+        'file with contract source code(default $ZKSYNC_HOME/contracts/contracts/${contractName}.sol)'
+    )
+    .description('Read value of contract variable')
+    .action(async (address: string, contractName: string, variableName: string, cmd: Command) => {
+        await readVariable(address, contractName, variableName, cmd.file);
     });

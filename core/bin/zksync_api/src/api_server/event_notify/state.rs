@@ -1,10 +1,11 @@
 use crate::api_server::rpc_server::types::{BlockInfo, ResponseAccountState};
-use crate::utils::token_db_cache::TokenDBCache;
 use lru_cache::LruCache;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use zksync_storage::chain::operations::records::StoredExecutedPriorityOperation;
 use zksync_storage::chain::operations_ext::records::TxReceiptResponse;
 use zksync_storage::ConnectionPool;
+use zksync_token_db_cache::TokenDBCache;
+use zksync_types::aggregated_operations::AggregatedActionType;
 use zksync_types::tx::TxHash;
 use zksync_types::BlockNumber;
 use zksync_types::{AccountId, ActionType, Address};
@@ -15,19 +16,20 @@ pub struct NotifierState {
     pub(super) cache_of_transaction_receipts: LruCache<Vec<u8>, TxReceiptResponse>,
     pub(super) cache_of_blocks_info: LruCache<BlockNumber, BlockInfo>,
     pub(super) tokens_cache: TokenDBCache,
-
     pub(super) db_pool: ConnectionPool,
 }
 
 impl NotifierState {
-    pub fn new(cache_capacity: usize, db_pool: ConnectionPool) -> Self {
-        let tokens_cache = TokenDBCache::new(db_pool.clone());
-
+    pub fn new(
+        cache_capacity: usize,
+        db_pool: ConnectionPool,
+        token_cache_invalidate_period: Duration,
+    ) -> Self {
         Self {
             cache_of_executed_priority_operations: LruCache::new(cache_capacity),
             cache_of_transaction_receipts: LruCache::new(cache_capacity),
             cache_of_blocks_info: LruCache::new(cache_capacity),
-            tokens_cache,
+            tokens_cache: TokenDBCache::new(token_cache_invalidate_period),
             db_pool,
         }
     }
@@ -66,7 +68,7 @@ impl NotifierState {
 
     pub async fn get_block_info(
         &mut self,
-        block_number: u32,
+        block_number: BlockNumber,
     ) -> Result<Option<BlockInfo>, anyhow::Error> {
         let start = Instant::now();
         let res = if let Some(block_info) = self.cache_of_blocks_info.get_mut(&block_number) {
@@ -80,19 +82,19 @@ impl NotifierState {
                 .get_block(block_number)
                 .await?
             {
-                let verified = if let Some(block_verify) = transaction
+                let verified = transaction
                     .chain()
                     .operations_schema()
-                    .get_operation(block_number, ActionType::VERIFY)
+                    .get_stored_aggregated_operation(
+                        block_number,
+                        AggregatedActionType::ExecuteBlocks,
+                    )
                     .await
-                {
-                    block_verify.confirmed
-                } else {
-                    false
-                };
+                    .map(|operation| operation.confirmed)
+                    .unwrap_or_default();
 
                 BlockInfo {
-                    block_number: i64::from(block_with_op.block_number),
+                    block_number: i64::from(*block_with_op.block_number),
                     committed: true,
                     verified,
                 }
@@ -107,9 +109,11 @@ impl NotifierState {
             // Unverified blocks can still change, so we can't cache them.
             // Since request for non-existing block will return the last committed block,
             // we must also check that block number matches the requested one.
-            if block_info.verified && block_info.block_number == block_number as i64 {
-                self.cache_of_blocks_info
-                    .insert(block_info.block_number as u32, block_info.clone());
+            if block_info.verified && block_info.block_number == *block_number as i64 {
+                self.cache_of_blocks_info.insert(
+                    BlockNumber(block_info.block_number as u32),
+                    block_info.clone(),
+                );
             }
 
             block_info
@@ -158,7 +162,9 @@ impl NotifierState {
         action: ActionType,
     ) -> anyhow::Result<(AccountId, ResponseAccountState)> {
         let start = Instant::now();
+
         let mut storage = self.db_pool.access_storage().await?;
+
         let account_state = storage
             .chain()
             .account_schema()
@@ -177,7 +183,7 @@ impl NotifierState {
         }
         .map(|(_, a)| a)
         {
-            ResponseAccountState::try_restore(account, &self.tokens_cache).await?
+            ResponseAccountState::try_restore(&mut storage, &self.tokens_cache, account).await?
         } else {
             ResponseAccountState::default()
         };
@@ -201,6 +207,7 @@ impl NotifierState {
                     .account_schema()
                     .last_committed_state_for_account(id)
                     .await?
+                    .1
             }
             ActionType::VERIFY => {
                 storage
@@ -212,7 +219,7 @@ impl NotifierState {
         };
 
         let account = if let Some(account) = stored_account {
-            ResponseAccountState::try_restore(account, &self.tokens_cache)
+            ResponseAccountState::try_restore(&mut storage, &self.tokens_cache, account)
                 .await
                 .ok()
         } else {

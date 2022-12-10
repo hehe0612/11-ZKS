@@ -1,12 +1,17 @@
+// Built-in imports
+use std::str::FromStr;
 // External imports
 use serde::{Deserialize, Serialize};
 use sqlx::{types::BigDecimal, FromRow};
 // Workspace imports
 // Local imports
-use crate::tokens::utils::{address_to_stored_string, stored_str_address_to_address};
+use crate::utils::{address_to_stored_string, stored_str_address_to_address};
 use chrono::{DateTime, Utc};
-use zksync_types::tokens::TokenPrice;
-use zksync_types::{Token, TokenId};
+use zksync_api_types::v02::token::ApiNFT;
+use zksync_types::{
+    tokens::{TokenMarketVolume, TokenPrice},
+    AccountId, Address, Token, TokenId, H256, NFT,
+};
 use zksync_utils::big_decimal_to_ratio;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, FromRow)]
@@ -15,27 +20,58 @@ pub struct DbToken {
     pub address: String,
     pub symbol: String,
     pub decimals: i16,
+    pub kind: TokenKind,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Copy, PartialEq, sqlx::Type)]
+#[sqlx(type_name = "token_kind")]
+pub enum TokenKind {
+    ERC20,
+    NFT,
+    None,
+}
+
+impl From<TokenKind> for zksync_types::TokenKind {
+    fn from(kind: TokenKind) -> zksync_types::TokenKind {
+        match kind {
+            TokenKind::ERC20 => zksync_types::TokenKind::ERC20,
+            TokenKind::NFT => zksync_types::TokenKind::NFT,
+            TokenKind::None => zksync_types::TokenKind::None,
+        }
+    }
+}
+
+impl From<zksync_types::TokenKind> for TokenKind {
+    fn from(kind: zksync_types::TokenKind) -> TokenKind {
+        match kind {
+            zksync_types::TokenKind::ERC20 => TokenKind::ERC20,
+            zksync_types::TokenKind::NFT => TokenKind::NFT,
+            zksync_types::TokenKind::None => TokenKind::None,
+        }
+    }
 }
 
 impl From<Token> for DbToken {
     fn from(token: Token) -> Self {
         Self {
-            id: token.id as i32,
+            id: *token.id as i32,
             address: address_to_stored_string(&token.address),
             symbol: token.symbol,
             decimals: token.decimals as i16,
+            kind: token.kind.into(),
         }
     }
 }
 
-impl Into<Token> for DbToken {
-    fn into(self) -> Token {
-        Token {
-            id: self.id as TokenId,
-            address: stored_str_address_to_address(&self.address),
-            symbol: self.symbol,
-            decimals: self.decimals as u8,
-        }
+impl From<DbToken> for Token {
+    fn from(val: DbToken) -> Token {
+        Token::new(
+            TokenId(val.id as u32),
+            stored_str_address_to_address(&val.address),
+            &val.symbol,
+            val.decimals as u8,
+            val.kind.into(),
+        )
     }
 }
 
@@ -46,11 +82,89 @@ pub struct DbTickerPrice {
     pub last_updated: DateTime<Utc>,
 }
 
-impl Into<TokenPrice> for DbTickerPrice {
-    fn into(self) -> TokenPrice {
-        TokenPrice {
-            usd_price: big_decimal_to_ratio(&self.usd_price).expect("Price could not be negative"),
-            last_updated: self.last_updated,
+#[derive(Debug, FromRow)]
+pub struct StorageNFT {
+    // Unique token id in zksync
+    pub token_id: i32,
+    // Counter of generated tokens for the creator
+    // Required to enforce uniqueness of address
+    pub serial_id: i32,
+    pub creator_account_id: i32,
+    pub creator_address: Vec<u8>,
+    pub address: Vec<u8>,
+    pub content_hash: Vec<u8>,
+    pub symbol: String,
+}
+
+#[derive(Debug, FromRow)]
+pub struct StorageApiNFT {
+    pub token_id: i32,
+    pub serial_id: i32,
+    pub creator_account_id: i32,
+    pub creator_address: Vec<u8>,
+    pub address: Vec<u8>,
+    pub content_hash: Vec<u8>,
+    pub symbol: String,
+    pub current_factory: String,
+    pub withdrawn_factory: Option<String>,
+}
+
+impl From<DbTickerPrice> for TokenPrice {
+    fn from(val: DbTickerPrice) -> Self {
+        Self {
+            usd_price: big_decimal_to_ratio(&val.usd_price).expect("Price could not be negative"),
+            last_updated: val.last_updated,
+        }
+    }
+}
+
+impl From<StorageNFT> for NFT {
+    fn from(val: StorageNFT) -> Self {
+        Self {
+            id: TokenId(val.token_id as u32),
+            serial_id: val.serial_id as u32,
+            creator_address: Address::from_slice(val.creator_address.as_slice()),
+            creator_id: AccountId(val.creator_account_id as u32),
+            address: Address::from_slice(val.address.as_slice()),
+            symbol: val.symbol,
+            content_hash: H256::from_slice(val.content_hash.as_slice()),
+        }
+    }
+}
+
+impl From<StorageApiNFT> for ApiNFT {
+    fn from(val: StorageApiNFT) -> Self {
+        let current_factory = val.current_factory.strip_prefix("0x").unwrap();
+        let withdrawn_factory = val
+            .withdrawn_factory
+            .map(|t| t.strip_prefix("0x").unwrap().to_string());
+        Self {
+            id: TokenId(val.token_id as u32),
+            serial_id: val.serial_id as u32,
+            creator_address: Address::from_slice(val.creator_address.as_slice()),
+            creator_id: AccountId(val.creator_account_id as u32),
+            address: Address::from_slice(val.address.as_slice()),
+            symbol: val.symbol,
+            content_hash: H256::from_slice(val.content_hash.as_slice()),
+            current_factory: Address::from_str(current_factory).unwrap(),
+            withdrawn_factory: withdrawn_factory.map(|t| Address::from_str(&t).unwrap()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, FromRow)]
+pub struct DBMarketVolume {
+    pub token_id: i32,
+    pub market_volume: BigDecimal,
+    pub last_updated: DateTime<Utc>,
+}
+
+impl From<DBMarketVolume> for TokenMarketVolume {
+    fn from(val: DBMarketVolume) -> Self {
+        Self {
+            market_volume: big_decimal_to_ratio(&val.market_volume)
+                .expect("Price could not be negative"),
+            last_updated: val.last_updated,
         }
     }
 }

@@ -1,4 +1,5 @@
 // External imports
+use chrono::{DateTime, Utc};
 use sqlx::{types::BigDecimal, FromRow};
 // Workspace imports
 // Local imports
@@ -13,6 +14,22 @@ pub struct StorageETHOperation {
     pub final_hash: Option<Vec<u8>>,
     pub last_deadline_block: i64,
     pub last_used_gas_price: BigDecimal,
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, FromRow, PartialEq)]
+pub struct ETHOperationData {
+    pub id: i64,
+    pub nonce: i64,
+    pub confirmed: bool,
+    pub raw_tx: Vec<u8>,
+    pub op_type: String,
+    pub final_hash: Option<Vec<u8>>,
+    pub last_deadline_block: i64,
+    pub last_used_gas_price: BigDecimal,
+    pub agg_op_id: Option<i64>,
+    pub arguments: Option<serde_json::Value>,
+    pub created_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, FromRow, PartialEq)]
@@ -23,37 +40,30 @@ pub struct ETHTxHash {
 }
 
 #[derive(Debug, FromRow, PartialEq)]
-pub struct ETHBinding {
-    pub id: i64,
-    pub op_id: i64,
-    pub eth_op_id: i64,
-}
-
-#[derive(Debug, FromRow, PartialEq)]
 pub struct ETHParams {
     pub id: bool,
     pub nonce: i64,
     pub gas_price_limit: i64,
     pub average_gas_price: Option<i64>,
-    pub commit_ops: i64,
-    pub verify_ops: i64,
-    pub withdraw_ops: i64,
+    pub last_committed_block: i64,
+    pub last_verified_block: i64,
+    pub last_executed_block: i64,
 }
 
 /// A slice of `ETHParams` structure with only stats part in it.
 #[derive(Debug)]
 pub struct ETHStats {
-    pub commit_ops: i64,
-    pub verify_ops: i64,
-    pub withdraw_ops: i64,
+    pub last_committed_block: i64,
+    pub last_verified_block: i64,
+    pub last_executed_block: i64,
 }
 
 impl From<ETHParams> for ETHStats {
     fn from(params: ETHParams) -> Self {
         Self {
-            commit_ops: params.commit_ops,
-            verify_ops: params.verify_ops,
-            withdraw_ops: params.withdraw_ops,
+            last_committed_block: params.last_committed_block,
+            last_verified_block: params.last_verified_block,
+            last_executed_block: params.last_executed_block,
         }
     }
 }

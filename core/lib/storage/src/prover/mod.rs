@@ -1,14 +1,17 @@
 // Built-in deps
 use std::time::Instant;
 // External imports
-use sqlx::Done;
+use anyhow::format_err;
 // Workspace imports
 use zksync_types::BlockNumber;
 // Local imports
 use self::records::{StorageProverJobQueue, StoredAggregatedProof, StoredProof};
+use crate::chain::operations::OperationsSchema;
 use crate::prover::records::StorageBlockWitness;
 use crate::{QueryResult, StorageProcessor};
+use chrono::{TimeZone, Utc};
 use zksync_crypto::proof::{AggregatedProof, SingleProof};
+use zksync_types::aggregated_operations::AggregatedActionType;
 use zksync_types::prover::{ProverJob, ProverJobStatus, ProverJobType};
 
 pub mod records;
@@ -24,8 +27,8 @@ impl<'a, 'c> ProverSchema<'a, 'c> {
     pub async fn pending_jobs_count(&mut self) -> QueryResult<u32> {
         let start = Instant::now();
         let pending_jobs_count = sqlx::query!(
-            "SELECT COUNT(*) FROM prover_job_queue WHERE job_status = $1",
-            ProverJobStatus::Idle.to_number()
+            "SELECT COUNT(*) FROM prover_job_queue WHERE job_status != $1",
+            ProverJobStatus::Done.to_number()
         )
         .fetch_one(self.0.conn())
         .await?
@@ -43,6 +46,7 @@ impl<'a, 'c> ProverSchema<'a, 'c> {
         job_priority: i32,
         job_type: ProverJobType,
     ) -> QueryResult<()> {
+        let start = Instant::now();
         sqlx::query!(
         "
           WITH job_values as (
@@ -55,22 +59,27 @@ impl<'a, 'c> ProverSchema<'a, 'c> {
             ProverJobStatus::Idle.to_number(),
             job_priority,
             job_type.to_string(),
-            i64::from(first_block),
-            i64::from(last_block),
+            i64::from(*first_block),
+            i64::from(*last_block),
             job_data,
         ).execute(self.0.conn()).await?;
+
+        metrics::histogram!("sql", start.elapsed(), "prover" => "add_prover_job_to_job_queue");
         Ok(())
     }
-    //
+
     pub async fn mark_stale_jobs_as_idle(&mut self) -> QueryResult<()> {
-        sqlx::query!(
+        let start = Instant::now();
+        let result = sqlx::query!(
             "UPDATE prover_job_queue SET (job_status, updated_at, updated_by) = ($1, now(), 'server_clean_idle')
-            WHERE job_status = $2 and (now() - updated_at) >= interval '120 seconds'",
+            WHERE job_status = $2 AND (now() - INTERVAL '120 seconds') >= updated_at RETURNING id",
             ProverJobStatus::Idle.to_number(),
             ProverJobStatus::InProgress.to_number(),
         )
-        .execute(self.0.conn())
+        .fetch_all(self.0.conn())
         .await?;
+        metrics::counter!("stale_jobs", result.len() as u64);
+        metrics::histogram!("sql", start.elapsed(), "prover" => "mark_stale_jobs_as_idle");
         Ok(())
     }
 
@@ -110,8 +119,8 @@ impl<'a, 'c> ProverSchema<'a, 'c> {
 
             Some(ProverJob::new(
                 job.id,
-                job.first_block as BlockNumber,
-                job.last_block as BlockNumber,
+                BlockNumber(job.first_block as u32),
+                BlockNumber(job.last_block as u32),
                 job.job_data,
             ))
         } else {
@@ -167,33 +176,69 @@ impl<'a, 'c> ProverSchema<'a, 'c> {
         job_id: i32,
         block_number: BlockNumber,
         proof: &SingleProof,
-    ) -> QueryResult<usize> {
+    ) -> QueryResult<()> {
         let start = Instant::now();
         let mut transaction = self.0.start_transaction().await?;
-        sqlx::query!(
+        let updated_rows = sqlx::query!(
             "UPDATE prover_job_queue
             SET (updated_at, job_status, updated_by) = (now(), $1, 'server_finish_job')
-            WHERE id = $2",
+            WHERE id = $2 AND job_type = $3",
             ProverJobStatus::Done.to_number(),
             job_id,
-        )
-        .execute(transaction.conn())
-        .await?;
-        let updated_rows = sqlx::query!(
-            "INSERT INTO proofs (block_number, proof)
-            VALUES ($1, $2)",
-            i64::from(block_number),
-            serde_json::to_value(proof).unwrap()
+            ProverJobType::SingleProof.to_string()
         )
         .execute(transaction.conn())
         .await?
-        .rows_affected() as usize;
-        transaction.commit().await?;
+        .rows_affected();
 
+        if updated_rows != 1 {
+            return Err(format_err!("Missing job for stored proof"));
+        }
+
+        sqlx::query!(
+            "INSERT INTO proofs (block_number, proof)
+            VALUES ($1, $2)",
+            i64::from(*block_number),
+            serde_json::to_value(proof).unwrap()
+        )
+        .execute(transaction.conn())
+        .await?;
+
+        transaction
+            .prover_schema()
+            .set_block_processing_metrics(block_number, block_number, "single_proof".to_string())
+            .await?;
+        transaction.commit().await?;
         metrics::histogram!("sql", start.elapsed(), "prover" => "store_proof");
-        Ok(updated_rows)
+        Ok(())
     }
 
+    // Set metrics about stages in block processing
+    async fn set_block_processing_metrics(
+        &mut self,
+        first_block: BlockNumber,
+        last_block: BlockNumber,
+        stage: String,
+    ) -> QueryResult<()> {
+        for block_number in first_block.0..=last_block.0 {
+            let block = self
+                .0
+                .chain()
+                .block_schema()
+                .get_storage_block(block_number.into())
+                .await?;
+            if let Some(block) = block {
+                let time = Utc.timestamp(block.timestamp.unwrap_or_default(), 0);
+                // It's almost impossible situation, but it could be triggered in tests
+                let duration = (Utc::now() - time).to_std().unwrap_or_default();
+                let labels = vec![("stage", stage.clone())];
+                metrics::histogram!("process_block", duration, &labels);
+            } else {
+                vlog::error!("Block for proof doesn't exist")
+            }
+        }
+        Ok(())
+    }
     /// Stores the aggregated proof for blocks.
     pub async fn store_aggregated_proof(
         &mut self,
@@ -201,32 +246,42 @@ impl<'a, 'c> ProverSchema<'a, 'c> {
         first_block: BlockNumber,
         last_block: BlockNumber,
         proof: &AggregatedProof,
-    ) -> QueryResult<usize> {
+    ) -> QueryResult<()> {
         let start = Instant::now();
         let mut transaction = self.0.start_transaction().await?;
-        sqlx::query!(
+        let updated_rows = sqlx::query!(
             "UPDATE prover_job_queue
             SET (updated_at, job_status, updated_by) = (now(), $1, 'server_finish_job')
-            WHERE id = $2",
+            WHERE id = $2 AND job_type = $3",
             ProverJobStatus::Done.to_number(),
-            job_id
-        )
-        .execute(transaction.conn())
-        .await?;
-        let updated_rows = sqlx::query!(
-            "INSERT INTO aggregated_proofs (first_block, last_block, proof)
-            VALUES ($1, $2, $3)",
-            i64::from(first_block),
-            i64::from(last_block),
-            serde_json::to_value(proof).unwrap()
+            job_id,
+            ProverJobType::AggregatedProof.to_string()
         )
         .execute(transaction.conn())
         .await?
         .rows_affected() as usize;
+
+        if updated_rows != 1 {
+            return Err(format_err!("Missing job for stored aggregated proof"));
+        }
+
+        sqlx::query!(
+            "INSERT INTO aggregated_proofs (first_block, last_block, proof)
+            VALUES ($1, $2, $3)",
+            i64::from(*first_block),
+            i64::from(*last_block),
+            serde_json::to_value(proof).unwrap()
+        )
+        .execute(transaction.conn())
+        .await?;
+        transaction
+            .prover_schema()
+            .set_block_processing_metrics(first_block, last_block, "aggregated_proof".to_string())
+            .await?;
         transaction.commit().await?;
 
         metrics::histogram!("sql", start.elapsed(), "prover" => "store_aggregated_proof");
-        Ok(updated_rows)
+        Ok(())
     }
 
     /// Gets the stored proof for a block.
@@ -238,7 +293,7 @@ impl<'a, 'c> ProverSchema<'a, 'c> {
         let proof = sqlx::query_as!(
             StoredProof,
             "SELECT * FROM proofs WHERE block_number = $1",
-            i64::from(block_number),
+            i64::from(*block_number),
         )
         .fetch_optional(self.0.conn())
         .await?
@@ -258,8 +313,8 @@ impl<'a, 'c> ProverSchema<'a, 'c> {
         let proof = sqlx::query_as!(
             StoredAggregatedProof,
             "SELECT * FROM aggregated_proofs WHERE first_block = $1 and last_block = $2",
-            i64::from(first_block),
-            i64::from(last_block)
+            i64::from(*first_block),
+            i64::from(*last_block)
         )
         .fetch_optional(self.0.conn())
         .await?
@@ -282,7 +337,7 @@ impl<'a, 'c> ProverSchema<'a, 'c> {
             VALUES ($1, $2)
             ON CONFLICT (block)
             DO NOTHING",
-            i64::from(block),
+            i64::from(*block),
             witness_str
         )
         .execute(self.0.conn())
@@ -292,7 +347,7 @@ impl<'a, 'c> ProverSchema<'a, 'c> {
         Ok(())
     }
 
-    /// Gets stored witness for a block
+    /// Gets stored witness for a block.
     pub async fn get_witness(
         &mut self,
         block_number: BlockNumber,
@@ -301,7 +356,7 @@ impl<'a, 'c> ProverSchema<'a, 'c> {
         let block_witness = sqlx::query_as!(
             StorageBlockWitness,
             "SELECT * FROM block_witness WHERE block = $1",
-            i64::from(block_number),
+            i64::from(*block_number),
         )
         .fetch_optional(self.0.conn())
         .await?;
@@ -315,6 +370,7 @@ impl<'a, 'c> ProverSchema<'a, 'c> {
         &mut self,
         action_type: ProverJobType,
     ) -> QueryResult<BlockNumber> {
+        let start = Instant::now();
         let last_block = sqlx::query!(
             "SELECT max(last_block) from prover_job_queue
             WHERE job_type = $1",
@@ -322,9 +378,98 @@ impl<'a, 'c> ProverSchema<'a, 'c> {
         )
         .fetch_one(self.0.conn())
         .await?
-        .max
-        .unwrap_or(0);
+        .max;
 
-        Ok(last_block as BlockNumber)
+        let result = if let Some(last_block) = last_block {
+            BlockNumber(last_block as u32)
+        } else {
+            // this branch executes when prover job queue is empty
+            match action_type {
+                ProverJobType::SingleProof => {
+                    OperationsSchema(self.0)
+                        .get_last_block_by_aggregated_action(
+                            AggregatedActionType::CreateProofBlocks,
+                            None,
+                        )
+                        .await?
+                }
+                ProverJobType::AggregatedProof => {
+                    OperationsSchema(self.0)
+                        .get_last_block_by_aggregated_action(
+                            AggregatedActionType::PublishProofBlocksOnchain,
+                            None,
+                        )
+                        .await?
+                }
+            }
+        };
+
+        metrics::histogram!("sql", start.elapsed(), "prover" => "get_last_block_prover_job_queue");
+        Ok(result)
+    }
+
+    // Removes witnesses for blocks with number greater than `last_block`
+    pub async fn remove_witnesses(&mut self, last_block: BlockNumber) -> QueryResult<()> {
+        let start = Instant::now();
+        sqlx::query!(
+            "DELETE FROM block_witness WHERE block > $1",
+            *last_block as i64
+        )
+        .execute(self.0.conn())
+        .await?;
+
+        metrics::histogram!("sql", start.elapsed(), "prover" => "remove_witnesses");
+        Ok(())
+    }
+
+    // Removes proofs for blocks with number greater than `last_block`
+    pub async fn remove_proofs(&mut self, last_block: BlockNumber) -> QueryResult<()> {
+        let start = Instant::now();
+        sqlx::query!(
+            "DELETE FROM proofs WHERE block_number > $1",
+            *last_block as i64
+        )
+        .execute(self.0.conn())
+        .await?;
+
+        metrics::histogram!("sql", start.elapsed(), "prover" => "remove_proofs");
+        Ok(())
+    }
+
+    // Removes aggregated proofs for blocks with number greater than `last_block`
+    pub async fn remove_aggregated_proofs(&mut self, last_block: BlockNumber) -> QueryResult<()> {
+        let start = Instant::now();
+        sqlx::query!(
+            "DELETE FROM aggregated_proofs WHERE last_block > $1",
+            *last_block as i64
+        )
+        .execute(self.0.conn())
+        .await?;
+
+        metrics::histogram!("sql", start.elapsed(), "prover" => "remove_aggregated_proofs");
+        Ok(())
+    }
+
+    // Removes blocks with number greater than `last_block` from prover job queue
+    pub async fn remove_prover_jobs(&mut self, last_block: BlockNumber) -> QueryResult<()> {
+        let start = Instant::now();
+        let mut transaction = self.0.start_transaction().await?;
+        sqlx::query!(
+            "DELETE FROM prover_job_queue WHERE first_block > $1",
+            *last_block as i64
+        )
+        .execute(transaction.conn())
+        .await?;
+
+        sqlx::query!(
+            "UPDATE prover_job_queue SET last_block = $1 WHERE last_block > $1",
+            *last_block as i64
+        )
+        .execute(transaction.conn())
+        .await?;
+        transaction.commit().await?;
+
+        metrics::histogram!("sql", start.elapsed(), "prover" => "remove_prover_jobs");
+        Ok(())
     }
 }

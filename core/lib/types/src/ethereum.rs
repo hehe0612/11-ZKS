@@ -1,51 +1,13 @@
 //! Common primitives for the Ethereum network interaction.
 // Built-in deps
-use std::{convert::TryFrom, fmt, str::FromStr};
 // External uses
-use ethabi::{decode, ParamType};
-use serde::{Deserialize, Serialize};
+use thiserror::Error;
 // Local uses
 use crate::aggregated_operations::{AggregatedActionType, AggregatedOperation};
-use zksync_basic_types::{Log, H256, U256};
+use zksync_basic_types::{H256, U256};
 
 /// Numerical identifier of the Ethereum operation.
 pub type EthOpId = i64;
-
-/// Type of the transactions sent to the Ethereum network.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum OperationType {
-    /// Commit action (`commitBlock` method of the smart contract).
-    Commit,
-    /// Verify action (`verifyBlock` method of the smart contract).
-    Verify,
-    /// Withdraw action (`completeWithdrawals` method of the smart contract).
-    Withdraw,
-}
-
-impl fmt::Display for OperationType {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Commit => write!(f, "commit"),
-            Self::Verify => write!(f, "verify"),
-            Self::Withdraw => write!(f, "withdraw"),
-        }
-    }
-}
-
-impl FromStr for OperationType {
-    type Err = anyhow::Error;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let op = match s {
-            "commit" => Self::Commit,
-            "verify" => Self::Verify,
-            "withdraw" => Self::Withdraw,
-            _ => anyhow::bail!("Unknown type of operation: {}", s),
-        };
-
-        Ok(op)
-    }
-}
 
 /// Stored Ethereum operation.
 #[derive(Debug, Clone)]
@@ -116,42 +78,6 @@ pub struct InsertedOperationResponse {
     pub nonce: U256,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompleteWithdrawalsTx {
-    pub tx_hash: H256,
-    pub pending_withdrawals_queue_start_index: u32,
-    pub pending_withdrawals_queue_end_index: u32,
-}
-
-impl TryFrom<Log> for CompleteWithdrawalsTx {
-    type Error = anyhow::Error;
-
-    fn try_from(event: Log) -> Result<CompleteWithdrawalsTx, anyhow::Error> {
-        let mut decoded_event = decode(
-            &[
-                ParamType::Uint(32), // queueStartIndex
-                ParamType::Uint(32), // queueEndIndex
-            ],
-            &event.data.0,
-        )
-        .map_err(|e| anyhow::format_err!("Event data decode: {:?}", e))?;
-
-        Ok(CompleteWithdrawalsTx {
-            tx_hash: event
-                .transaction_hash
-                .expect("complete withdrawals transaction should have hash"),
-            pending_withdrawals_queue_start_index: decoded_event
-                .remove(0)
-                .to_uint()
-                .as_ref()
-                .map(U256::as_u32)
-                .expect("pending_withdrawals_queue_start_index value conversion failed"),
-            pending_withdrawals_queue_end_index: decoded_event
-                .remove(0)
-                .to_uint()
-                .as_ref()
-                .map(U256::as_u32)
-                .expect("pending_withdrawals_queue_end_index value conversion failed"),
-        })
-    }
-}
+#[derive(Debug, Error, PartialEq)]
+#[error("Unknown type of operation: {0}")]
+pub struct UnknownOperationType(pub String);

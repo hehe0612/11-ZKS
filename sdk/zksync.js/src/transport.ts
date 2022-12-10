@@ -9,14 +9,15 @@ import { Signer } from './signer';
 const W3CWebSocket = websocket.w3cwebsocket;
 
 export abstract class AbstractJSONRPCTransport {
-    abstract async request(method: string, params): Promise<any>;
+    abstract request(method: string, params): Promise<any>;
     subscriptionsSupported(): boolean {
         return false;
     }
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
     async subscribe(subMethod: string, subParams, unsubMethod: string, cb: (data: any) => void): Promise<Subscription> {
         throw new Error('subscription are not supported for this transport');
     }
-    abstract async disconnect();
+    abstract disconnect();
 }
 
 // Has jrpcError field which is JRPC error object.
@@ -42,7 +43,7 @@ export class HTTPTransport extends AbstractJSONRPCTransport {
     }
 
     // JSON RPC request
-    async request(method: string, params = null): Promise<any> {
+    async request(method: string, params = null, config?: any): Promise<any> {
         const request = {
             id: 1,
             jsonrpc: '2.0',
@@ -50,7 +51,7 @@ export class HTTPTransport extends AbstractJSONRPCTransport {
             params
         };
 
-        const response = await Axios.post(this.address, request).then((resp) => {
+        const response = await Axios.post(this.address, request, config).then((resp) => {
             return resp.data;
         });
 
@@ -69,6 +70,9 @@ export class HTTPTransport extends AbstractJSONRPCTransport {
     async disconnect() {}
 }
 
+/**
+ * @deprecated Websocket support will be removed in future. Use HTTP transport instead.
+ */
 export class WSTransport extends AbstractJSONRPCTransport {
     ws: WebSocketAsPromised;
     private subscriptionCallback: Map<string, (data: any) => void>;
@@ -102,11 +106,16 @@ export class WSTransport extends AbstractJSONRPCTransport {
         return transport;
     }
 
-    subscriptionsSupported(): boolean {
+    override subscriptionsSupported(): boolean {
         return true;
     }
 
-    async subscribe(subMethod: string, subParams, unsubMethod: string, cb: (data: any) => void): Promise<Subscription> {
+    override async subscribe(
+        subMethod: string,
+        subParams,
+        unsubMethod: string,
+        cb: (data: any) => void
+    ): Promise<Subscription> {
         const req = { jsonrpc: '2.0', method: subMethod, params: subParams };
         const sub = await this.ws.sendRequest(req);
 
@@ -163,13 +172,8 @@ export class WSTransport extends AbstractJSONRPCTransport {
 }
 
 export class DummyTransport extends AbstractJSONRPCTransport {
-    public constructor(public network: string, public ethPrivateKey: Uint8Array) {
+    public constructor(public network: string, public ethPrivateKey: Uint8Array, public getTokens: Function) {
         super();
-    }
-
-    getTokensList(network: string) {
-        const configPath = `${process.env.ZKSYNC_HOME}/etc/tokens/${network}.json`;
-        return require(configPath);
     }
 
     async getPubKeyHash(): Promise<PubKeyHash> {
@@ -189,13 +193,13 @@ export class DummyTransport extends AbstractJSONRPCTransport {
         }
 
         if (method == 'tokens') {
-            const tokensList = this.getTokensList(this.network);
+            const tokensList = this.getTokens();
             const tokens = {};
 
             let id = 1;
             for (const tokenItem of tokensList.slice(0, 3)) {
                 const token = {
-                    address: tokenItem.address.slice(2),
+                    address: tokenItem.address,
                     id: id,
                     symbol: tokenItem.symbol,
                     decimals: tokenItem.decimals

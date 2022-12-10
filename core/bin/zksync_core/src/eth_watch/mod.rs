@@ -6,41 +6,33 @@
 //! Number of confirmations is configured using the `CONFIRMATIONS_FOR_ETH_EVENT` environment variable.
 
 // Built-in deps
-use std::{
-    collections::HashMap,
-    time::{Duration, Instant},
-};
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 // External uses
 use futures::{
     channel::{mpsc, oneshot},
     SinkExt, StreamExt,
 };
+use thiserror::Error;
 
+pub use client::{get_web3_block_number, EthHttpClient};
+use itertools::Itertools;
 use tokio::{task::JoinHandle, time};
-use web3::types::{Address, BlockNumber};
+use web3::types::BlockNumber;
 
-// Workspace deps
-use zksync_config::ConfigurationOptions;
+use zksync_config::{ContractsConfig, ETHWatchConfig};
 use zksync_crypto::params::PRIORITY_EXPIRATION;
-use zksync_storage::ConnectionPool;
-use zksync_types::{Nonce, PriorityOp, PubKeyHash, ZkSyncPriorityOp};
+use zksync_eth_client::ethereum_gateway::EthereumGateway;
+use zksync_mempool::MempoolTransactionRequest;
+use zksync_types::{NewTokenEvent, PriorityOp, RegisterNFTFactoryEvent, SerialId};
 
 // Local deps
-use self::{
-    client::EthClient,
-    eth_state::ETHState,
-    received_ops::{sift_outdated_ops, ReceivedPriorityOp},
-    storage::Storage,
-};
-
-pub use client::EthHttpClient;
-pub use storage::DBStorage;
+use self::{client::EthClient, eth_state::ETHState, received_ops::sift_outdated_ops};
 
 mod client;
 mod eth_state;
 mod received_ops;
-mod storage;
 
 #[cfg(test)]
 mod tests;
@@ -57,7 +49,7 @@ const RATE_LIMIT_DELAY: Duration = Duration::from_secs(30);
 /// watcher goes into "backoff" mode in which polling is disabled for a
 /// certain amount of time.
 #[derive(Debug)]
-enum WatcherMode {
+pub enum WatcherMode {
     /// ETHWatcher operates normally.
     Working,
     /// Polling is currently disabled.
@@ -67,41 +59,42 @@ enum WatcherMode {
 #[derive(Debug)]
 pub enum EthWatchRequest {
     PollETHNode,
-    IsPubkeyChangeAuthorized {
-        address: Address,
-        nonce: Nonce,
-        pubkey_hash: PubKeyHash,
-        resp: oneshot::Sender<bool>,
+    GetNewTokens {
+        last_eth_block: Option<u64>,
+        resp: oneshot::Sender<Vec<NewTokenEvent>>,
     },
-    GetPriorityQueueOps {
-        op_start_id: u64,
-        max_chunks: usize,
-        resp: oneshot::Sender<Vec<PriorityOp>>,
-    },
-    GetUnconfirmedDeposits {
-        address: Address,
-        resp: oneshot::Sender<Vec<PriorityOp>>,
-    },
-    GetUnconfirmedOpByHash {
-        eth_hash: Vec<u8>,
-        resp: oneshot::Sender<Option<PriorityOp>>,
+    GetRegisterNFTFactoryEvents {
+        last_eth_block: Option<u64>,
+        resp: oneshot::Sender<Vec<RegisterNFTFactoryEvent>>,
     },
 }
 
-pub struct EthWatch<W: EthClient, S: Storage> {
+#[derive(Debug, Error)]
+#[error("A priority op log is missing: last processed id is {0}, next is {1}")]
+struct MissingPriorityOpError(SerialId, SerialId);
+
+fn is_missing_priority_op_error(error: &anyhow::Error) -> bool {
+    error.is::<MissingPriorityOpError>()
+}
+
+pub struct EthWatch<W: EthClient> {
     client: W,
-    storage: S,
+    mempool_tx_sender: mpsc::Sender<MempoolTransactionRequest>,
     eth_state: ETHState,
     /// All ethereum events are accepted after sufficient confirmations to eliminate risk of block reorg.
     number_of_confirmations_for_event: u64,
     mode: WatcherMode,
 }
 
-impl<W: EthClient, S: Storage> EthWatch<W, S> {
-    pub fn new(client: W, storage: S, number_of_confirmations_for_event: u64) -> Self {
+impl<W: EthClient> EthWatch<W> {
+    pub fn new(
+        client: W,
+        mempool_tx_sender: mpsc::Sender<MempoolTransactionRequest>,
+        number_of_confirmations_for_event: u64,
+    ) -> Self {
         Self {
             client,
-            storage,
+            mempool_tx_sender,
             eth_state: ETHState::default(),
             mode: WatcherMode::Working,
             number_of_confirmations_for_event,
@@ -134,43 +127,102 @@ impl<W: EthClient, S: Storage> EthWatch<W, S> {
 
     async fn process_new_blocks(&mut self, last_ethereum_block: u64) -> anyhow::Result<()> {
         debug_assert!(self.eth_state.last_ethereum_block() < last_ethereum_block);
+        debug_assert!(self.eth_state.last_ethereum_block() < last_ethereum_block);
 
-        let (unconfirmed_queue, received_priority_queue) = self
-            .update_eth_state(last_ethereum_block, self.number_of_confirmations_for_event)
+        // We have to process every block between the current and previous known values.
+        // This is crucial since `eth_watch` may enter the backoff mode in which it will skip many blocks.
+        // Note that we don't have to add `number_of_confirmations_for_event` here, because the check function takes
+        // care of it on its own. Here we calculate "how many blocks should we watch", and the offsets with respect
+        // to the `number_of_confirmations_for_event` are calculated by `update_eth_state`.
+        let mut next_priority_op_id = self.eth_state.next_priority_op_id();
+        let previous_ethereum_block = self.eth_state.last_ethereum_block();
+        let block_difference = last_ethereum_block.saturating_sub(previous_ethereum_block);
+
+        let updated_state = self
+            .update_eth_state(last_ethereum_block, block_difference)
             .await?;
+
+        // It's assumed that for the current state all priority operations have consecutive ids,
+        // i.e. there're no gaps. Thus, there're two opportunities for missing them: either
+        // we're missing last operations from the previous ethereum blocks range or there's a gap
+        // in the updated state.
 
         // Extend the existing priority operations with the new ones.
         let mut priority_queue = sift_outdated_ops(self.eth_state.priority_queue());
-        for (serial_id, op) in received_priority_queue {
-            priority_queue.insert(serial_id, op);
+
+        // Iterate through new priority operations sorted by their serial id.
+        for (serial_id, op) in updated_state
+            .priority_queue()
+            .iter()
+            .sorted_by_key(|(id, _)| **id)
+        {
+            if *serial_id > next_priority_op_id {
+                // Updated state misses some logs for new priority operations.
+                // We have to revert the block range back. This will only move the watcher
+                // backwards for a single time since `last_ethereum_block` and its backup will
+                // be equal.
+                self.eth_state.reset_last_ethereum_block();
+                return Err(anyhow::Error::from(MissingPriorityOpError(
+                    next_priority_op_id,
+                    *serial_id,
+                )));
+            } else {
+                // Next serial id matched the expected one.
+                priority_queue.insert(*serial_id, op.clone());
+                next_priority_op_id = next_priority_op_id.max(*serial_id + 1);
+            }
         }
 
-        let new_state = ETHState::new(last_ethereum_block, unconfirmed_queue, priority_queue);
+        // Extend the existing token events with the new ones.
+        let mut new_tokens = self.eth_state.new_tokens().to_vec();
+        for token in updated_state.new_tokens() {
+            new_tokens.push(token.clone());
+        }
+        // Remove duplicates.
+        new_tokens.sort_by_key(|token_event| token_event.id.0);
+        new_tokens.dedup_by_key(|token_event| token_event.id.0);
+
+        let mut register_nft_factory_events =
+            self.eth_state.new_register_nft_factory_events().to_vec();
+        for event in updated_state.new_register_nft_factory_events() {
+            register_nft_factory_events.push(event.clone());
+        }
+        // Remove duplicates.
+        register_nft_factory_events.sort_by_key(|factory_event| factory_event.creator_address);
+        register_nft_factory_events.dedup_by_key(|factory_event| factory_event.creator_address);
+
+        let new_state = ETHState::new(
+            last_ethereum_block,
+            previous_ethereum_block,
+            updated_state.unconfirmed_queue().to_vec(),
+            priority_queue,
+            new_tokens,
+            register_nft_factory_events,
+        );
         self.set_new_state(new_state);
         Ok(())
     }
 
     async fn restore_state_from_eth(&mut self, last_ethereum_block: u64) -> anyhow::Result<()> {
-        let (unconfirmed_queue, priority_queue) = self
+        let new_state = self
             .update_eth_state(last_ethereum_block, PRIORITY_EXPIRATION)
             .await?;
 
-        let new_state = ETHState::new(last_ethereum_block, unconfirmed_queue, priority_queue);
-
         self.set_new_state(new_state);
-        log::trace!("ETH state: {:#?}", self.eth_state);
+
+        vlog::debug!("ETH state: {:#?}", self.eth_state);
         Ok(())
     }
 
     async fn update_eth_state(
         &mut self,
         current_ethereum_block: u64,
-        depth_of_last_approved_block: u64,
-    ) -> anyhow::Result<(Vec<PriorityOp>, HashMap<u64, ReceivedPriorityOp>)> {
+        unprocessed_blocks_amount: u64,
+    ) -> anyhow::Result<ETHState> {
         let new_block_with_accepted_events =
             current_ethereum_block.saturating_sub(self.number_of_confirmations_for_event);
         let previous_block_with_accepted_events =
-            new_block_with_accepted_events.saturating_sub(depth_of_last_approved_block);
+            new_block_with_accepted_events.saturating_sub(unprocessed_blocks_amount);
 
         let unconfirmed_queue = self.get_unconfirmed_ops(current_ethereum_block).await?;
         let priority_queue = self
@@ -179,64 +231,102 @@ impl<W: EthClient, S: Storage> EthWatch<W, S> {
                 BlockNumber::Number(previous_block_with_accepted_events.into()),
                 BlockNumber::Number(new_block_with_accepted_events.into()),
             )
-            .await?
-            .into_iter()
+            .await?;
+        let priority_queue_map: HashMap<u64, _> = priority_queue
+            .iter()
+            .cloned()
             .map(|priority_op| (priority_op.serial_id, priority_op.into()))
             .collect();
 
-        Ok((unconfirmed_queue, priority_queue))
+        let new_tokens = self
+            .client
+            .get_new_tokens_events(
+                BlockNumber::Number(previous_block_with_accepted_events.into()),
+                BlockNumber::Number(new_block_with_accepted_events.into()),
+            )
+            .await?;
+
+        let new_register_nft_factory_events = self
+            .client
+            .get_new_register_nft_factory_events(
+                BlockNumber::Number(previous_block_with_accepted_events.into()),
+                BlockNumber::Number(new_block_with_accepted_events.into()),
+            )
+            .await?;
+
+        let mut new_priority_op_ids: Vec<_> = priority_queue_map.keys().cloned().collect();
+        new_priority_op_ids.sort_unstable();
+        vlog::debug!(
+            "Updating eth state: block_range=[{},{}], new_priority_ops={:?}",
+            previous_block_with_accepted_events,
+            new_block_with_accepted_events,
+            new_priority_op_ids
+        );
+
+        // Add unconfirmed priority ops to queue
+        let (sender, receiver) = oneshot::channel();
+        self.mempool_tx_sender
+            .send(MempoolTransactionRequest::NewPriorityOps(
+                unconfirmed_queue.clone(),
+                false,
+                sender,
+            ))
+            .await?;
+
+        // TODO maybe retry? It can be the only problem is database
+        receiver.await.expect("Mempool actor was dropped")?;
+        // Add confirmed priority ops to queue
+        let (sender, receiver) = oneshot::channel();
+        self.mempool_tx_sender
+            .send(MempoolTransactionRequest::NewPriorityOps(
+                priority_queue,
+                true,
+                sender,
+            ))
+            .await?;
+
+        // TODO maybe retry? It can be the only problem is database
+        receiver.await.expect("Mempool actor was dropped")?;
+        // The backup block number is not used.
+        let state = ETHState::new(
+            current_ethereum_block,
+            current_ethereum_block,
+            unconfirmed_queue,
+            priority_queue_map,
+            new_tokens,
+            new_register_nft_factory_events,
+        );
+        Ok(state)
     }
 
-    fn get_priority_requests(&self, first_serial_id: u64, max_chunks: usize) -> Vec<PriorityOp> {
-        let mut result = Vec::new();
+    fn get_register_factory_event(
+        &self,
+        last_block_number: Option<u64>,
+    ) -> Vec<RegisterNFTFactoryEvent> {
+        let mut events = self.eth_state.new_register_nft_factory_events().to_vec();
 
-        let mut used_chunks = 0;
-        let mut current_priority_op = first_serial_id;
-
-        while let Some(op) = self.eth_state.priority_queue().get(&current_priority_op) {
-            if used_chunks + op.as_ref().data.chunks() <= max_chunks {
-                result.push(op.as_ref().clone());
-                used_chunks += op.as_ref().data.chunks();
-                current_priority_op += 1;
-            } else {
-                break;
-            }
+        if let Some(last_block_number) = last_block_number {
+            events = events
+                .iter()
+                .filter(|event| event.eth_block > last_block_number)
+                .cloned()
+                .collect();
         }
 
-        result
+        events
     }
+    fn get_new_tokens(&self, last_block_number: Option<u64>) -> Vec<NewTokenEvent> {
+        let mut new_tokens = self.eth_state.new_tokens().to_vec();
 
-    async fn is_new_pubkey_hash_authorized(
-        &self,
-        address: Address,
-        nonce: Nonce,
-        pub_key_hash: &PubKeyHash,
-    ) -> anyhow::Result<bool> {
-        let auth_fact = self.client.get_auth_fact(address, nonce).await?;
-        Ok(auth_fact.as_slice() == tiny_keccak::keccak256(&pub_key_hash.data[..]))
-    }
+        if let Some(last_block_number) = last_block_number {
+            new_tokens = new_tokens
+                .iter()
+                .filter(|token| token.eth_block_number > last_block_number)
+                .cloned()
+                .collect();
+        }
 
-    fn find_ongoing_op_by_hash(&self, eth_hash: &[u8]) -> Option<PriorityOp> {
-        self.eth_state
-            .unconfirmed_queue()
-            .iter()
-            .find(|op| op.eth_hash.as_slice() == eth_hash)
-            .cloned()
-    }
-
-    fn get_ongoing_deposits_for(&self, address: Address) -> Vec<PriorityOp> {
-        self.eth_state
-            .unconfirmed_queue()
-            .iter()
-            .filter(|op| match &op.data {
-                ZkSyncPriorityOp::Deposit(deposit) => {
-                    // Address may be set to either sender or recipient.
-                    deposit.from == address || deposit.to == address
-                }
-                _ => false,
-            })
-            .cloned()
-            .collect()
+        new_tokens
     }
 
     async fn poll_eth_node(&mut self) -> anyhow::Result<()> {
@@ -259,6 +349,9 @@ impl<W: EthClient, S: Storage> EthWatch<W, S> {
     fn enter_backoff_mode(&mut self) {
         let backoff_until = Instant::now() + RATE_LIMIT_DELAY;
         self.mode = WatcherMode::Backoff(backoff_until);
+        // This is needed to track how much time is spent in backoff mode
+        // and trigger grafana alerts
+        metrics::histogram!("eth_watcher.enter_backoff_mode", RATE_LIMIT_DELAY);
     }
 
     fn polling_allowed(&mut self) -> bool {
@@ -266,7 +359,7 @@ impl<W: EthClient, S: Storage> EthWatch<W, S> {
             WatcherMode::Working => true,
             WatcherMode::Backoff(delay_until) => {
                 if Instant::now() >= delay_until {
-                    log::info!("Exiting the backoff mode");
+                    vlog::info!("Exiting the backoff mode");
                     self.mode = WatcherMode::Working;
                     true
                 } else {
@@ -277,7 +370,7 @@ impl<W: EthClient, S: Storage> EthWatch<W, S> {
         }
     }
 
-    pub async fn run(mut self, mut eth_watch_req: mpsc::Receiver<EthWatchRequest>) {
+    pub async fn restore_from_eth_using_latest_block_number(&mut self) {
         // As infura may be not responsive, we want to retry the query until we've actually got the
         // block number.
         // Normally, however, this loop is not expected to last more than one iteration.
@@ -289,13 +382,13 @@ impl<W: EthClient, S: Storage> EthWatch<W, S> {
                     break block;
                 }
                 Err(error) => {
-                    log::warn!(
+                    vlog::warn!(
                         "Unable to fetch last block number: '{}'. Retrying again in {} seconds",
                         error,
                         RATE_LIMIT_DELAY.as_secs()
                     );
 
-                    time::delay_for(RATE_LIMIT_DELAY).await;
+                    time::sleep(RATE_LIMIT_DELAY).await;
                 }
             }
         };
@@ -307,7 +400,9 @@ impl<W: EthClient, S: Storage> EthWatch<W, S> {
         self.restore_state_from_eth(block)
             .await
             .expect("Unable to restore ETHWatcher state");
+    }
 
+    pub async fn run(mut self, mut eth_watch_req: mpsc::Receiver<EthWatchRequest>) {
         while let Some(request) = eth_watch_req.next().await {
             match request {
                 EthWatchRequest::PollETHNode => {
@@ -320,74 +415,67 @@ impl<W: EthClient, S: Storage> EthWatch<W, S> {
 
                     if let Err(error) = poll_result {
                         if self.is_backoff_requested(&error) {
-                            log::warn!(
+                            vlog::warn!(
                                 "Rate limit was reached, as reported by Ethereum node. \
                                 Entering the backoff mode"
                             );
                             self.enter_backoff_mode();
+                        } else if is_missing_priority_op_error(&error) {
+                            vlog::warn!("{}\nEntering the backoff mode", error);
+                            // Wait for some time and try to fetch new logs again.
+                            self.enter_backoff_mode();
                         } else {
                             // Some unexpected kind of error, we won't shutdown the node because of it,
                             // but rather expect node administrators to handle the situation.
-                            log::error!("Failed to process new blocks {}", error);
+                            vlog::error!("Failed to process new blocks {}", error);
                         }
                     }
                 }
-                EthWatchRequest::GetPriorityQueueOps {
-                    op_start_id,
-                    max_chunks,
+                EthWatchRequest::GetNewTokens {
+                    last_eth_block,
                     resp,
                 } => {
-                    resp.send(self.get_priority_requests(op_start_id, max_chunks))
-                        .unwrap_or_default();
+                    resp.send(self.get_new_tokens(last_eth_block)).ok();
                 }
-                EthWatchRequest::GetUnconfirmedDeposits { address, resp } => {
-                    let deposits_for_address = self.get_ongoing_deposits_for(address);
-                    resp.send(deposits_for_address).unwrap_or_default();
-                }
-                EthWatchRequest::GetUnconfirmedOpByHash { eth_hash, resp } => {
-                    let unconfirmed_op = self.find_ongoing_op_by_hash(&eth_hash);
-                    resp.send(unconfirmed_op).unwrap_or_default();
-                }
-                EthWatchRequest::IsPubkeyChangeAuthorized {
-                    address,
-                    nonce,
-                    pubkey_hash,
+                EthWatchRequest::GetRegisterNFTFactoryEvents {
+                    last_eth_block,
                     resp,
                 } => {
-                    let authorized = self
-                        .is_new_pubkey_hash_authorized(address, nonce, &pubkey_hash)
-                        .await
-                        .unwrap_or(false);
-                    resp.send(authorized).unwrap_or_default();
+                    resp.send(self.get_register_factory_event(last_eth_block))
+                        .ok();
                 }
             }
         }
     }
 }
 
-#[must_use]
-pub fn start_eth_watch(
-    config_options: ConfigurationOptions,
+pub async fn start_eth_watch(
     eth_req_sender: mpsc::Sender<EthWatchRequest>,
     eth_req_receiver: mpsc::Receiver<EthWatchRequest>,
-    db_pool: ConnectionPool,
+    eth_gateway: EthereumGateway,
+    contract_config: &ContractsConfig,
+    eth_watcher_config: &ETHWatchConfig,
+    mempool_req_sender: mpsc::Sender<MempoolTransactionRequest>,
 ) -> JoinHandle<()> {
-    let transport = web3::transports::Http::new(&config_options.web3_url).unwrap();
-    let web3 = web3::Web3::new(transport);
-    let eth_client = EthHttpClient::new(web3, config_options.contract_eth_addr);
-
-    let storage = DBStorage::new(db_pool);
-
-    let eth_watch = EthWatch::new(
-        eth_client,
-        storage,
-        config_options.confirmations_for_eth_event,
+    let eth_client = EthHttpClient::new(
+        eth_gateway,
+        contract_config.contract_addr,
+        contract_config.governance_addr,
     );
+
+    let mut eth_watch = EthWatch::new(
+        eth_client,
+        mempool_req_sender,
+        eth_watcher_config.confirmations_for_eth_event,
+    );
+
+    eth_watch.restore_from_eth_using_latest_block_number().await;
 
     tokio::spawn(eth_watch.run(eth_req_receiver));
 
+    let poll_interval = eth_watcher_config.poll_interval();
     tokio::spawn(async move {
-        let mut timer = time::interval(config_options.eth_watch_poll_interval);
+        let mut timer = time::interval(poll_interval);
 
         loop {
             timer.tick().await;

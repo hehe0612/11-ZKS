@@ -12,12 +12,21 @@ categories = ["cryptography"]
 [dependencies]
 zksync_types = { path = "../types", version = "1.0" }
 zksync_eth_signer = { path = "../eth_signer", version = "1.0" }
+zksync_config = { path = "../config", version = "1.0" }
+zksync_contracts = { path = "../contracts", version = "1.0" }
+vlog = { path = "../../lib/vlog", version = "1.0" }
 
 serde = "1.0.90"
-ethabi = "12.0.0"
-web3 = "0.13.0"
-parity-crypto = {version = "0.6.2", features = ["publickey"] }
+ethabi = "16.0.0"
+web3 = "0.18.0"
+parity-crypto = {version = "0.8", features = ["publickey"] }
+hex = "0.4"
 
-log = "0.4"
 anyhow = "1.0"
+tokio = { version = "1", features = ["full"] }
+metrics = { version = "0.17", optional = true }
+
+[features]
+default= ['with-metrics']
+with-metrics = ["metrics"]
 
